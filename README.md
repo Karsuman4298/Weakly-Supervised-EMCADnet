@@ -14,7 +14,7 @@ class="center">
 ## Qualitative Results
 
 <p align="center">
-<img src="qualitative_results_clinicdb.png" width=80% height=25% 
+<img src="qualitative_results_clinicdb.jpeg" width=80% height=25% 
 class="center">
 </p>
 
