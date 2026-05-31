@@ -18,6 +18,13 @@ class="center">
 class="center">
 </p>
 
+## Scribble Masking
+
+<p align="center">
+<img src="scribble_mask.png" width=90% height=30% 
+class="center">
+</p>
+
 ## Usage:
 ### Recommended environment:
 **Please run the following commands.**
