@@ -16,34 +16,69 @@ from utils import clip_gradient, adjust_lr, AvgMeter, cal_params_flops
 
 
 def structure_loss_weak(pred, weak_mask):
+    """
+    Original partial supervision loss (L_p component)
+    Only supervises labeled pixels (ignores pixels marked as 255)
+    """
     eps = 1e-6
     valid = (weak_mask != 255).float()
     target = weak_mask.clone()
     target[target == 255] = 0.0
     prob = torch.sigmoid(pred)
+    
     bce = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
     bce = (bce * valid).sum() / (valid.sum() + eps)
+
     prob_flat = (prob * valid).view(-1)
     target_flat = (target * valid).view(-1)
     inter = (prob_flat * target_flat).sum()
     dice = 1 - (2 * inter + eps) / (prob_flat.sum() + target_flat.sum() + eps)
+    
+  
     laplacian_kernel = torch.tensor(
-        [[1,1,1],
-         [1,-8,1],
-         [1,1,1]],
+        [[1, 1, 1],
+         [1, -8, 1],
+         [1, 1, 1]],
         dtype=torch.float32,
         device=pred.device
-    ).view(1,1,3,3)
+    ).view(1, 1, 3, 3)
     pred_edge = F.conv2d(prob, laplacian_kernel, padding=1)
     target_edge = F.conv2d(target, laplacian_kernel, padding=1)
-
     edge_loss = F.l1_loss(pred_edge * valid, target_edge * valid)
+    
     loss = (
         1.0 * bce +
         1.2 * dice +
         0.3 * edge_loss
     )
     return loss
+
+
+def sparse_foreground_loss(pred, weak_mask):
+    """
+    Sparse foreground loss (L_f component)
+    Treats ALL non-foreground pixels as background
+    This suppresses false positives by providing negative pressure
+    on unlabeled regions
+    """
+    foreground_only = (weak_mask == 1).float()
+    
+    # Compute BCE on ALL pixels (including unlabeled!)
+    # This is the key difference from structure_loss_weak
+    # Unlabeled pixels are treated as background (0)
+    loss = F.binary_cross_entropy_with_logits(
+        pred,
+        foreground_only,
+        reduction='mean'
+    )
+    return loss
+
+
+def combined_weak_loss(pred, weak_mask, alpha=0.5):
+    loss_p = structure_loss_weak(pred, weak_mask)
+    loss_f = sparse_foreground_loss(pred, weak_mask)
+    total_loss = loss_p + alpha * loss_f
+    return total_loss, loss_p, loss_f
 
 
 def dice_coefficient(predicted, labels):
@@ -173,13 +208,14 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
                 mode='nearest'
             )
 
-            loss_p1 = structure_loss_weak(P[0], weak_masks_resized)
-            loss_p2 = structure_loss_weak(P[1], weak_masks_resized)
-            loss_p3 = structure_loss_weak(P[2], weak_masks_resized)
-            loss_p4 = structure_loss_weak(P[3], weak_masks_resized)
-            loss_p1234 = structure_loss_weak(
+            loss_p1,_,_ = combined_weak_loss(P[0], weak_masks_resized,alpha=opt.alpha)
+            loss_p2,_,_ = combined_weak_loss(P[1], weak_masks_resized,alpha=opt.alpha)
+            loss_p3,_,_ = combined_weak_loss(P[2], weak_masks_resized,alpha=opt.alpha)
+            loss_p4,_,_ = combined_weak_loss(P[3], weak_masks_resized,alpha=opt.alpha)
+            loss_p1234,_,_ = combined_weak_loss(
                 P[0] + P[1] + P[2] + P[3],
-                weak_masks_resized
+                weak_masks_resized,
+                alpha=opt.alpha
             )
 
             weights = [1, 1, 1, 1, 1]
@@ -253,7 +289,8 @@ if __name__ == '__main__':
     parser.add_argument('--supervision', type=str,
                     default='mutation', help='loss supervision: mutation, deep_supervision or last_layer')    
     parser.add_argument('--epoch', type=int, default=200)
-    parser.add_argument('--lr', type=float, default=0.0005) # base learning rate is 0.0005 for CosineAnnealingLR and 0.0001 for no scheduler
+    parser.add_argument('--lr', type=float, default=0.0005) 
+    parser.add_argument('--alpha', type=float, default=0.3)
     parser.add_argument('--batchsize', type=int, default=8)
     parser.add_argument('--test_batchsize', type=int, default=8)
     parser.add_argument('--img_size', type=int, default=352)
@@ -265,6 +302,7 @@ if __name__ == '__main__':
     parser.add_argument('--train_path', type=str, default=f'./data/polyp/target/{dataset_name}/train/')
     parser.add_argument('--test_path', type=str, default=f'./data/polyp/target/{dataset_name}/')
     parser.add_argument('--train_save', type=str, default='') 
+    
     opt = parser.parse_args()
 
     for run in [1,2,3,4,5]:
