@@ -62,9 +62,8 @@ def sparse_foreground_loss(pred, weak_mask):
     on unlabeled regions
     """
     foreground_only = (weak_mask == 1).float()
-    
+
     # Compute BCE on ALL pixels (including unlabeled!)
-    # This is the key difference from structure_loss_weak
     # Unlabeled pixels are treated as background (0)
     loss = F.binary_cross_entropy_with_logits(
         pred,
