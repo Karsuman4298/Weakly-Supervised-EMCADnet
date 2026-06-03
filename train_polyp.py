@@ -201,12 +201,6 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
                 mode='nearest'
             )
 
-            gts_resized = F.interpolate(
-                gts,
-                size=P[0].shape[2:],
-                mode='nearest'
-            )
-
             loss_p1,_,_ = combined_weak_loss(P[0], weak_masks_resized,alpha=opt.alpha)
             loss_p2,_,_ = combined_weak_loss(P[1], weak_masks_resized,alpha=opt.alpha)
             loss_p3,_,_ = combined_weak_loss(P[2], weak_masks_resized,alpha=opt.alpha)
