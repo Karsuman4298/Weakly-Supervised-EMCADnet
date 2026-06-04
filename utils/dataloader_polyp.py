@@ -6,7 +6,7 @@ import torch.utils.data as data
 from PIL import Image
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-from weak_utils import create_scribble_mask
+from utils.weak_utils import create_scribble_mask
 class PolypDataset(data.Dataset):
     def __init__(self, image_root, gt_root, trainsize, augmentation, split='train', color_image=True):
         self.trainsize = trainsize

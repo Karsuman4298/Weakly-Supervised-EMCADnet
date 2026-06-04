@@ -12,7 +12,7 @@ from torch.autograd import Variable
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from lib.networks import EMCADNet
 from utils.dataloader import get_loader as get_loader
-from utils import clip_gradient, adjust_lr, AvgMeter, cal_params_flops
+from utils.utils import clip_gradient, adjust_lr, AvgMeter, cal_params_flops
 
 
 def structure_loss_weak(pred, weak_mask):

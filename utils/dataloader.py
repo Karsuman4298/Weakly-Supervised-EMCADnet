@@ -6,7 +6,7 @@ import torchvision.transforms as transforms
 import numpy as np
 import random
 import torch
-from weak_utils import create_scribble_mask
+from utils.weak_utils import create_scribble_mask
 
 
 class PolypDataset(data.Dataset):
