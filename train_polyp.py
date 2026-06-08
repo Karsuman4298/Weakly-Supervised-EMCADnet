@@ -136,13 +136,6 @@ def test(model, path, dataset, opt):
             for i in range(len(images)):
                 p = predictions[i].unsqueeze(0)
                 pred_resized = torch.sigmoid(p).squeeze()
-                # Normalize
-                pred_resized = (
-                    pred_resized - pred_resized.min()
-                ) / (
-                    pred_resized.max() - pred_resized.min() + 1e-8
-                )
-
                 gt_resized = gts[i].squeeze()
                 input_binary = (pred_resized >= 0.5).float()
                 target_binary = (gt_resized >= 0.5).float()
@@ -257,7 +250,7 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
     
 if __name__ == '__main__':
     # Initial defaults
-    dataset_name = 'ClinicDB' #'CVC-ColonDB' #'Kvasir' #ETIS-LaribPolypDB' #BCAI-IGH
+    dataset_name = 'ClinicDB' 
     
     parser = argparse.ArgumentParser()
     # network related parameters

@@ -171,9 +171,6 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
             print("Best model updated.")
 
 
-# ============================================================
-# MAIN
-# ============================================================
 
 if __name__ == '__main__':
 
