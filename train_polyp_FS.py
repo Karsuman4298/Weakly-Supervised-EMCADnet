@@ -106,7 +106,7 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
     size_rates = [0.75, 1, 1.25]
     total_step = len(train_loader)
 
-    for i, (images, gts) in enumerate(train_loader, start=1):
+    for i, (images, _, gts) in enumerate(train_loader, start=1):
         for rate in size_rates:
             optimizer.zero_grad()
             images = images.cuda()
