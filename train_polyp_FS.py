@@ -73,7 +73,7 @@ def test(model, path, dataset, opt):
     total_images = 0
 
     with torch.no_grad():
-        for images, gts in test_loader:
+        for images, _,gts in test_loader:
 
             images = images.cuda()
             gts = gts.cuda().float()
@@ -145,7 +145,7 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
             clip_gradient(optimizer, opt.clip)
             optimizer.step()
             if rate == 1:
-                loss_record.update(loss.item(), opt.batchsize)
+                loss_record.update(loss, opt.batchsize)
 
         if i % 50 == 0 or i == total_step:
             print(f'{datetime.now()} Epoch [{epoch}/{opt.epoch}], '

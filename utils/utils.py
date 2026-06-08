@@ -93,14 +93,20 @@ class AvgMeter(object):
         self.losses = []
 
     def update(self, val, n=1):
+         # Accept both float and tensor
+        if isinstance(val, torch.Tensor):
+            scalar = val.detach().cpu().float().item()
+        else:
+            scalar = float(val) 
         self.val = val
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
-        self.losses.append(val)
+        self.losses.append(torch.tensor(scalar, dtype=torch.float32))
 
     def show(self):
-        return torch.mean(torch.stack(self.losses[np.maximum(len(self.losses)-self.num, 0):]))
+        recent = self.losses[np.maximum(len(self.losses) - self.num, 0):]
+        return torch.mean(torch.stack(recent))
 
 def CalParams(model, input_tensor):
     """
