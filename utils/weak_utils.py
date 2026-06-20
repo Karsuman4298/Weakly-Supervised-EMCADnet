@@ -31,3 +31,7 @@ def create_scribble_mask(mask_pil):
         ] = 0
 
     return Image.fromarray(weak_mask)
+
+
+
+

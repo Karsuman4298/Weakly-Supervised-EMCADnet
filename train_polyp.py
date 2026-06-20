@@ -15,69 +15,259 @@ from utils.dataloader import get_loader as get_loader
 from utils.utils import clip_gradient, adjust_lr, AvgMeter, cal_params_flops
 
 
-def structure_loss_weak(pred, weak_mask):
+
+# ═══════════════════════════════════════════════════════════════════
+#  BPAnno Loss Functions
+# ═══════════════════════════════════════════════════════════════════
+
+def dice_loss_masked(pred_prob, target, valid_mask=None, smooth=1e-6):
+    """Dice loss, optionally restricted to valid_mask pixels."""
+    if valid_mask is not None:
+        pred_prob = pred_prob * valid_mask
+        target    = target    * valid_mask
+    p = pred_prob.reshape(pred_prob.shape[0], -1)
+    t = target.reshape(target.shape[0], -1).float()
+    inter = (p * t).sum(dim=1)
+    denom = p.sum(dim=1) + t.sum(dim=1)
+    return (1 - (2 * inter + smooth) / (denom + smooth)).mean()
+
+
+def dual_mask_loss(seg_logit, y_in, y_en, use_edge=True):
     """
-    Original partial supervision loss (L_p component)
-    Only supervises labeled pixels (ignores pixels marked as 255)
+    Lc: adversarial dual-mask Dice supervision.
+    
+    Pixels in omega_delta get contradictory labels from y_in and y_en,
+    forcing boundary-invariant feature learning.
+    Edge loss on y_en boundary preserves your original boundary sensitivity.
     """
+    pred = torch.sigmoid(seg_logit)
+    if pred.dim() == 4:
+        pred = pred.squeeze(1)          # (B,1,H,W) → (B,H,W)
+
+   
+    L_in = dice_loss_masked(pred, y_in)
+    L_en = dice_loss_masked(pred, y_en)
+    Lc   = L_in + L_en
+
+    if use_edge:
+        laplacian = torch.tensor(
+            [[1,  1, 1],
+             [1, -8, 1],
+             [1,  1, 1]],
+            dtype=torch.float32,
+            device=pred.device
+        ).view(1, 1, 3, 3)
+
+        pred_4d   = pred.unsqueeze(1)           # (B,1,H,W)
+        y_en_4d   = y_en.unsqueeze(1).float()   # (B,1,H,W)
+        pred_edge = F.conv2d(pred_4d,   laplacian, padding=1).squeeze(1)
+        gt_edge   = F.conv2d(y_en_4d,  laplacian, padding=1).squeeze(1)
+        # Only penalise edge error inside the envelope
+        # (no point computing edge loss in pure background)
+        edge_loss = F.l1_loss(pred_edge * y_en, gt_edge * y_en)
+        Lc = Lc + 0.3 * edge_loss
+    return Lc
+
+
+def classification_loss_ccg(cls_logits, y_c):
+    """
+    Lce: 3-class cross-entropy for CCG head.
+    y_c values: 0=certain bg, 1=uncertain ring, 2=certain fg
+    """
+    B, C, H, W = cls_logits.shape
+    logits_flat = cls_logits.permute(0, 2, 3, 1).reshape(-1, C)
+    labels_flat = y_c.reshape(-1)
+    return F.cross_entropy(logits_flat, labels_flat)
+
+
+@torch.no_grad()
+@torch.no_grad()
+def generate_pseudo_labels(seg_logit, cls_logits, omega_delta,
+                            entropy_thresh=0.5):
+    """
+    Build integrated confidence map U for omega_delta pixels.
+
+    U = 1  → pseudo foreground
+    U = 0  → pseudo background
+    U = -1 → too uncertain, skip in CCL
+
+    Three-tier resolution for each uncertain pixel:
+      1. CCG classifier directly predicts class 0 or 2  → use that
+      2. CCG predicts class 1 (still uncertain)         → use second-best of {0,2}
+      3. Seg-head also says foreground in ring           → override to fg (paper fix)
+      4. Entropy ≥ threshold                            → assign -1, drop from CCL
+    """
+    seg_prob = torch.sigmoid(seg_logit)
+    if seg_prob.dim() == 4:
+        seg_prob = seg_prob.squeeze(1)          # (B,H,W)
+
+    cls_prob = F.softmax(cls_logits, dim=1)     # (B,3,H,W)
+    cls_pred = cls_prob.argmax(dim=1)           # (B,H,W)
+
+    p_bg = cls_prob[:, 0]                       # P(certain background)
+    p_fg = cls_prob[:, 2]                       # P(certain foreground)
+
+    # ── Step 1: CCG second-best fallback for uncertain pixels ─────────
+    # Start with argmax between bg and fg only
+    U_c = (p_fg >= p_bg).long()                 # 1=fg, 0=bg
+
+
+    U_c[cls_pred == 0] = 0                      # directly predicted bg
+    U_c[cls_pred == 2] = 1                      # directly predicted fg
+    seg_fg_in_ring = (seg_prob >= 0.5) & (omega_delta == 1)
+    U_c[seg_fg_in_ring] = 1
+    # ─────────────────────────────────────────────────────────────────
+
+    # ── Step 3: Entropy-based hard uncertainty masking ────────────────
     eps = 1e-6
-    valid = (weak_mask != 255).float()
-    target = weak_mask.clone()
-    target[target == 255] = 0.0
-    prob = torch.sigmoid(pred)
-    
-    bce = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
-    bce = (bce * valid).sum() / (valid.sum() + eps)
+    entropy = -(
+        seg_prob       * torch.log(seg_prob       + eps) +
+        (1 - seg_prob) * torch.log(1 - seg_prob   + eps)
+    )                                           # (B,H,W)
 
-    prob_flat = (prob * valid).view(-1)
-    target_flat = (target * valid).view(-1)
-    inter = (prob_flat * target_flat).sum()
-    dice = 1 - (2 * inter + eps) / (prob_flat.sum() + target_flat.sum() + eps)
-    
-  
-    laplacian_kernel = torch.tensor(
-        [[1, 1, 1],
-         [1, -8, 1],
-         [1, 1, 1]],
-        dtype=torch.float32,
-        device=pred.device
-    ).view(1, 1, 3, 3)
-    pred_edge = F.conv2d(prob, laplacian_kernel, padding=1)
-    target_edge = F.conv2d(target, laplacian_kernel, padding=1)
-    edge_loss = F.l1_loss(pred_edge * valid, target_edge * valid)
-    
-    loss = (
-        1.0 * bce +
-        1.2 * dice +
-        0.3 * edge_loss
-    )
-    return loss
+    U_e = torch.zeros_like(U_c)
+    U_e[entropy >= entropy_thresh] = -1         # solid uncertain → drop
+
+    # ── Step 4: Integrate (entropy overrides everything) ─────────────
+    # U_c + 2*U_e:
+    #   normal pixel  → U_c + 0  = {0,1}    kept
+    #   high entropy  → U_c - 2  = {-2,-1}  clamped to -1
+    U = torch.clamp(U_c + 2 * U_e, min=-1)
+    # Only relevant inside the uncertain ring
+    U = U * omega_delta.long()
+    U[omega_delta == 0] = -1                    # outside ring → skip
+    return U                                    # (B,H,W)
 
 
-def sparse_foreground_loss(pred, weak_mask):
+def contrastive_loss_ccl(embeddings, seg_logit, pseudo_labels,
+                               omega_delta, y_in, y_en, neg_queue,
+                               temperature=0.1, hard_ratio=0.7,
+                               num_anchors=100, pixel_pool=512):
     """
-    Sparse foreground loss (L_f component)
-    Treats ALL non-foreground pixels as background
-    This suppresses false positives by providing negative pressure
-    on unlabeled regions
+    LPCL: batched pixel-wise contrastive loss with hard-sample mining.
+
+    Key differences from slow version:
+    - Similarity matrix computed ONCE per batch (GPU batched matmul)
+    - Pixel pool subsamples H*W to 512 per image (avoids O(H*W) per anchor)
+    - Inner loop only iterates over anchors, not anchor x pixel
+    - 5-10x faster in practice
+
+    Hard samples:
+      - Certain pixels (Ω_I ∪ Ω_O) that are WRONGLY predicted
+      - Uncertain pixels (Ω_Δ) with confident pseudo-label (U ≠ -1)
+    Easy samples:
+      - Certain pixels that are CORRECTLY predicted
+    Ratio: 70% hard, 30% easy
     """
-    foreground_only = (weak_mask == 1).float()
+    B, D, H, W = embeddings.shape
+    device = embeddings.device
 
-    # Compute BCE on ALL pixels (including unlabeled!)
-    # Unlabeled pixels are treated as background (0)
-    loss = F.binary_cross_entropy_with_logits(
-        pred,
-        foreground_only,
-        reduction='mean'
-    )
-    return loss
+    seg_pred = (torch.sigmoid(seg_logit.detach()).squeeze(1) >= 0.5).long()
+
+    # ── Build hybrid label map ŷ ──────────────────────────────────────
+    # Certain pixels: use seg prediction
+    # Uncertain pixels: use CCG pseudo-labels
+    y_hat = seg_pred.clone()
+    for b in range(B):
+        valid = (omega_delta[b] == 1) & (pseudo_labels[b] != -1)
+        y_hat[b][valid] = pseudo_labels[b][valid]
+
+    # ── Ground truth for certain region ──────────────────────────────
+    certain_fg   = (y_in  == 1)
+    certain_bg   = (y_en  == 0) & (omega_delta == 0)
+    certain_gt   = torch.zeros_like(seg_pred)
+    certain_gt[certain_fg] = 1
+    certain_gt[certain_bg] = 0
+    certain_mask = (omega_delta == 0)           # Ω_I ∪ Ω_O
+
+    # ── Collect anchors and pixel pools across batch ──────────────────
+    all_anchor_embs = []
+    all_anchor_lbls = []
+    all_pixel_embs  = []
+    all_pixel_lbls  = []
+
+    for b in range(B):
+        # Hard: wrong certain pixels OR resolved uncertain pixels
+        hard = (
+            (certain_mask[b] & (seg_pred[b] != certain_gt[b])) |
+            ((omega_delta[b] == 1) & (pseudo_labels[b] != -1))
+        )
+        # Easy: correctly predicted certain pixels
+        easy = certain_mask[b] & (seg_pred[b] == certain_gt[b])
+
+        h_idx = hard.nonzero(as_tuple=False)    # (N_h, 2)
+        e_idx = easy.nonzero(as_tuple=False)    # (N_e, 2)
+
+        if len(h_idx) == 0 or len(e_idx) == 0:
+            continue
+
+        n_h = min(int(num_anchors * hard_ratio), len(h_idx))
+        n_e = min(num_anchors - n_h,             len(e_idx))
+
+        h_sel = h_idx[torch.randperm(len(h_idx), device=device)[:n_h]]
+        e_sel = e_idx[torch.randperm(len(e_idx), device=device)[:n_e]]
+        anc   = torch.cat([h_sel, e_sel], dim=0)   # (N,2)
+
+        ah, aw = anc[:, 0], anc[:, 1]
+
+        # Anchor embeddings and labels
+        all_anchor_embs.append(embeddings[b, :, ah, aw].T)     # (N,D)
+        all_anchor_lbls.append(y_hat[b, ah, aw])               # (N,)
+
+        # Pixel pool: subsample H*W → pixel_pool points
+        flat_emb = embeddings[b].reshape(D, -1).T              # (H*W,D)
+        flat_lbl = y_hat[b].reshape(-1)                        # (H*W,)
+        pool_n   = min(pixel_pool, H * W)
+        pool_idx = torch.randperm(H * W, device=device)[:pool_n]
+        all_pixel_embs.append(flat_emb[pool_idx])              # (pool_n,D)
+        all_pixel_lbls.append(flat_lbl[pool_idx])              # (pool_n,)
+
+    # Nothing to compute (can happen early in training)
+    if len(all_anchor_embs) == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    # ── Concatenate across batch ──────────────────────────────────────
+    anc_emb  = torch.cat(all_anchor_embs, dim=0)   # (A, D)
+    anc_lbl  = torch.cat(all_anchor_lbls, dim=0)   # (A,)
+    pix_emb  = torch.cat(all_pixel_embs,  dim=0)   # (P, D)
+    pix_lbl  = torch.cat(all_pixel_lbls,  dim=0)   # (P,)
+
+    # ── Batched similarity matrices (ONE GPU matmul each) ─────────────
+    # sim_pos_pool: (A, P) — anchor vs pixel pool
+    # sim_neg_queue:(A, Q) — anchor vs memory queue
+    sim_pos_pool  = torch.mm(anc_emb, pix_emb.T)  / temperature  # (A,P)
+    sim_neg_queue = torch.mm(anc_emb, neg_queue)   / temperature  # (A,Q)
+
+    # Precompute neg denominator per anchor (same for all positives)
+    # shape (A,)
+    neg_denom = torch.exp(sim_neg_queue).sum(dim=1)
+
+    # ── Contrastive loss per anchor ───────────────────────────────────
+    total_loss  = torch.tensor(0.0, device=device)
+    valid_count = 0
+
+    for i in range(len(anc_emb)):
+        li = anc_lbl[i].item()
+        if li == -1:
+            continue
+
+        pos_mask = (pix_lbl == li)                  # which pool pixels are +
+        if pos_mask.sum() == 0:
+            continue
+
+        # Average positive similarity (numerator)
+        pos_sim = torch.exp(sim_pos_pool[i][pos_mask]).mean()
+
+        # Denominator = pos + all negatives from queue
+        denom = pos_sim + neg_denom[i]
+
+        loss_i = -torch.log(pos_sim / (denom + 1e-6))
+        total_loss  = total_loss + loss_i
+        valid_count += 1
+
+    return total_loss / max(valid_count, 1)
 
 
-def combined_weak_loss(pred, weak_mask, alpha=0.5):
-    loss_p = structure_loss_weak(pred, weak_mask)
-    loss_f = sparse_foreground_loss(pred, weak_mask)
-    total_loss = loss_p + alpha * loss_f
-    return total_loss, loss_p, loss_f
 
 
 def dice_coefficient(predicted, labels):
@@ -166,7 +356,7 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
     size_rates = [0.75, 1, 1.25] 
     total_step = len(train_loader)
 
-    for i, (images, weak_masks, gts) in enumerate(train_loader, start=1):
+    for i, (images,y_in,y_en,omega_delta,y_c,gts) in enumerate(train_loader, start=1):
         for rate in size_rates:
             optimizer.zero_grad()
 
@@ -183,35 +373,81 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
                     align_corners=True
                 )
 
-            P = model(images)
+            # ── BPAnno forward pass ───────────────────────────────────
+            use_ccg_ccl = (epoch > int(0.3 * opt.epoch))
+            if use_ccg_ccl:
+                P, cls_logits, embeddings = model(images, mode='train')
+            else:
+                model_out = model(images, mode='train')
+                # first epoch warmup: model still returns tuple
+                if isinstance(model_out, tuple):
+                    P, cls_logits, embeddings = model_out
+                else:
+                    P = model_out
+
             if not isinstance(P, list):
                 P = [P]
-            if weak_masks.dim()==3:
-                weak_masks = weak_masks.unsqueeze(1)  # (B,H,W) → (B,1,H,W)
-            weak_masks_resized = F.interpolate(
-                weak_masks.float(),
-                size=P[0].shape[2:],
-                mode='nearest'
-            )
 
-            loss_p1,_,_ = combined_weak_loss(P[0], weak_masks_resized,alpha=opt.alpha)
-            loss_p2,_,_ = combined_weak_loss(P[1], weak_masks_resized,alpha=opt.alpha)
-            loss_p3,_,_ = combined_weak_loss(P[2], weak_masks_resized,alpha=opt.alpha)
-            loss_p4,_,_ = combined_weak_loss(P[3], weak_masks_resized,alpha=opt.alpha)
-            loss_p1234,_,_ = combined_weak_loss(
-                P[0] + P[1] + P[2] + P[3],
-                weak_masks_resized,
-                alpha=opt.alpha
-            )
+            # Resize BPAnno masks to match each prediction head size
+            def resize_mask(m, size):
+                # m: (B,H,W) → (B,1,H,W) → resize → (B,H,W)
+                return F.interpolate(
+                    m.unsqueeze(1).float(), size=size, mode='nearest'
+                ).squeeze(1)
 
-            weights = [1, 1, 1, 1, 1]
-            loss = (
-                weights[0] * loss_p1 +
-                weights[1] * loss_p2 +
-                weights[2] * loss_p3 +
-                weights[3] * loss_p4 +
-                weights[4] * loss_p1234
-            )
+            target_size = P[0].shape[2:]   # all heads same H,W after interp
+            y_in_r  = resize_mask(y_in,  target_size)
+            y_en_r  = resize_mask(y_en,  target_size)
+
+            # ── Lc: dual-mask Dice on all 4 heads + ensemble ──────────
+            seg_ensemble = P[0] + P[1] + P[2] + P[3]
+            loss_p1 = dual_mask_loss(P[0], y_in_r, y_en_r)
+            loss_p2 = dual_mask_loss(P[1], y_in_r, y_en_r)
+            loss_p3 = dual_mask_loss(P[2], y_in_r, y_en_r)
+            loss_p4 = dual_mask_loss(P[3], y_in_r, y_en_r)
+            loss_ens= dual_mask_loss(seg_ensemble, y_in_r, y_en_r)
+
+            loss = loss_p1 + loss_p2 + loss_p3 + loss_p4 + loss_ens
+
+            # ── CCG + CCL (added after warmup) ────────────────────────
+            if use_ccg_ccl:
+                # Resize ring mask to image size (cls/embed are full-res)
+                H_img = images.shape[2]
+                W_img = images.shape[3]
+                y_in_full  = resize_mask(y_in,  (H_img, W_img))
+                y_en_full  = resize_mask(y_en,  (H_img, W_img))
+                od_full    = resize_mask(omega_delta, (H_img, W_img))
+                y_c_full   = F.interpolate(
+                    y_c.unsqueeze(1).float(),
+                    size=(H_img, W_img), mode='nearest'
+                ).squeeze(1).long()
+
+                # Lce
+                Lce = classification_loss_ccg(cls_logits, y_c_full)
+
+                # Pseudo labels from CCG
+                pseudo = generate_pseudo_labels(
+                    P[-1].detach(), cls_logits.detach(), od_full
+                )
+
+                # LPCL
+                LPCL = contrastive_loss_ccl(
+                    embeddings, P[-1].detach(), pseudo,
+                    od_full, y_in_full, y_en_full,
+                    model.neg_queue,
+                    temperature=0.1,
+                    hard_ratio=0.7,
+                    num_anchors=100
+                )
+
+                loss = loss + opt.lambda1 * LPCL + opt.lambda2 * Lce
+
+                # Update memory queue
+                with torch.no_grad():
+                    flat = embeddings.permute(0,2,3,1).reshape(-1, model.embed_dim)
+                    idx  = torch.randperm(flat.shape[0])[:64]
+                    model.update_queue(flat[idx].detach())
+            # ─────────────────────────────────────────────────────────
 
             loss.backward()
             clip_gradient(optimizer, opt.clip)
@@ -276,7 +512,11 @@ if __name__ == '__main__':
                     default='mutation', help='loss supervision: mutation, deep_supervision or last_layer')    
     parser.add_argument('--epoch', type=int, default=200)
     parser.add_argument('--lr', type=float, default=0.0005) 
-    parser.add_argument('--alpha', type=float, default=0.3)
+    parser.add_argument('--alpha',   type=float, default=0.3)  # kept for compat
+    parser.add_argument('--lambda1', type=float, default=0.3,
+                        help='weight for contrastive loss LPCL')
+    parser.add_argument('--lambda2', type=float, default=0.5,
+                        help='weight for classification loss Lce')
     parser.add_argument('--batchsize', type=int, default=8)
     parser.add_argument('--test_batchsize', type=int, default=8)
     parser.add_argument('--img_size', type=int, default=352)

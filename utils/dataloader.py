@@ -6,7 +6,70 @@ import torchvision.transforms as transforms
 import numpy as np
 import random
 import torch
-from utils.weak_utils import create_scribble_mask
+
+
+import cv2
+def generate_bpanno(gt_np, kernel_size=15, epsilon=2.0):
+    """
+    From a binary GT mask (H,W, values 0/1 float),
+    produce inscribed mask, envelope mask, uncertain ring,
+    and 3-class CCG label map.
+
+    Returns all as float32 numpy arrays (H, W).
+    y_c is int64.
+    """
+    # Work in uint8 [0,255]
+    gt_u8 = (gt_np * 255).astype(np.uint8)
+
+    # Adaptive kernel: at least 5, scales with lesion size
+    area = gt_u8.sum() / 255
+    if area > 0:
+        radius = np.sqrt(area / np.pi)
+        kernel_size = max(5, int(radius * 0.12))
+        # ensure odd
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
+    )
+
+    dilated = cv2.dilate(gt_u8, kernel, iterations=1)   # envelope
+    eroded  = cv2.erode(gt_u8,  kernel, iterations=1)   # inscribed
+
+    def to_poly_mask(binary_u8):
+        contours, _ = cv2.findContours(
+            binary_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+        )
+        out = np.zeros_like(binary_u8)
+        if not contours:
+            return out
+        c = max(contours, key=cv2.contourArea)
+        simplified = cv2.approxPolyDP(c, epsilon, closed=True)
+        cv2.fillPoly(out, [simplified], 255)
+        return out
+
+    y_en_u8 = to_poly_mask(dilated)
+    y_in_u8 = to_poly_mask(eroded)
+
+    # Edge case: erosion collapsed to empty → use GT itself
+    if y_in_u8.sum() == 0:
+        y_in_u8 = gt_u8.copy()
+
+    y_en = (y_en_u8 > 127).astype(np.float32)
+    y_in = (y_in_u8 > 127).astype(np.float32)
+
+    # Uncertain ring: inside envelope but outside inscribed
+    omega_delta = np.clip(y_en - y_in, 0, 1).astype(np.float32)
+
+    # 3-class label map for CCG
+    # 0=certain bg, 1=uncertain ring, 2=certain fg
+    y_c = np.zeros_like(y_in, dtype=np.int64)
+    y_c[y_en == 1] = 1       # start: everything inside envelope = uncertain
+    y_c[y_in == 1] = 2       # overwrite: inside inscribed = certain fg
+    # outside envelope stays 0 = certain bg
+
+    return y_in, y_en, omega_delta, y_c
 
 
 class PolypDataset(data.Dataset):
@@ -70,27 +133,26 @@ class PolypDataset(data.Dataset):
 
     def __getitem__(self, index):
         image = self.rgb_loader(self.images[index])
-        gt = self.binary_loader(self.gts[index])
-        seed = np.random.randint(2147483647)
-        random.seed(seed)
-        torch.manual_seed(seed)
+        gt    = self.binary_loader(self.gts[index])
 
+        seed = np.random.randint(2147483647)
+        random.seed(seed);  torch.manual_seed(seed)
         if self.img_transform is not None:
             image = self.img_transform(image)
 
-        random.seed(seed)
-        torch.manual_seed(seed)
-
+        random.seed(seed);  torch.manual_seed(seed)
         if self.gt_transform is not None:
-            gt = self.gt_transform(gt)
+            gt = self.gt_transform(gt)          # tensor (1,H,W) float
 
-        gt_np = gt.squeeze().cpu().numpy()  
-        scribble_pil = create_scribble_mask(
-            Image.fromarray((gt_np * 255).astype('uint8'))
-        )
-        weak_mask = torch.from_numpy(np.array(scribble_pil)).long()
-        return image, weak_mask, gt
+        # ── BPAnno generation ─────────────────────────────────────────
+        gt_np = gt.squeeze().cpu().numpy()      # (H,W) float [0,1]
+        y_in, y_en, omega_delta, y_c = generate_bpanno(gt_np)
 
+        y_in_t = torch.from_numpy(y_in).float()        # (H,W)
+        y_en_t = torch.from_numpy(y_en).float()        # (H,W)
+        omega_delta_t = torch.from_numpy(omega_delta).float() # (H,W)
+        y_c_t = torch.from_numpy(y_c).long()          # (H,W)
+        return image, y_in_t, y_en_t, omega_delta_t, y_c_t, gt
 
     def filter_files(self):
         assert len(self.images) == len(self.gts)
