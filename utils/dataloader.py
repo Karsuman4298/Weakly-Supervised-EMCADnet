@@ -194,32 +194,23 @@ class PolypDataset(data.Dataset):
         image = self.rgb_loader(self.images[index])
         gt    = self.binary_loader(self.gts[index])
 
-        # ── Synchronized augmentation for image and GT ────────
-        # Same seed ensures image and GT get identical spatial transforms
+        # Synchronized augmentation for image and GT
         seed = np.random.randint(2147483647)
-
         random.seed(seed)
         torch.manual_seed(seed)
-        image = self.img_transform(image)   # (3, H, W)
-
+        image = self.img_transform(image) # (3, H, W)
         random.seed(seed)
         torch.manual_seed(seed)
-        gt = self.gt_transform(gt)          # (1, H, W) float [0,1]
-
-        # ── BPAnno generation (from already-transformed GT) ───
+        gt = self.gt_transform(gt)  # (1, H, W) float [0,1]
+        #BPAnno generation(from already-transformed GT)
         # gt is already resized and augmented, so BPAnno masks
         # are always spatially aligned with the image
         gt_np = gt.squeeze().cpu().numpy()  # (H, W) float [0,1]
-
         y_in, y_en, omega_delta, y_c = generate_bpanno(gt_np)
-
-        y_in_t        = torch.from_numpy(y_in).float()         # (H, W)
-        y_en_t        = torch.from_numpy(y_en).float()         # (H, W)
+        y_in_t  = torch.from_numpy(y_in).float()   # (H, W)
+        y_en_t = torch.from_numpy(y_en).float()    # (H, W)
         omega_delta_t = torch.from_numpy(omega_delta).float()  # (H, W)
-        y_c_t         = torch.from_numpy(y_c).long()           # (H, W)
-
-        # Returns 6 items — update train.py unpack accordingly:
-        # for images, y_in, y_en, omega_delta, y_c, gts in train_loader:
+        y_c_t = torch.from_numpy(y_c).long()   # (H, W)
         return image, y_in_t, y_en_t, omega_delta_t, y_c_t, gt
 
     def filter_files(self):
