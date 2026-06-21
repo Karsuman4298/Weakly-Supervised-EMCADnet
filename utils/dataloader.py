@@ -9,37 +9,33 @@ import torch
 import cv2
 
 
-# ─── BPAnno Configuration ─────────────────────────────────────
-# From your Kaggle notebook test results:
-#   dilation_scale = 0.40  → Ring mean ~9.7%  ✓ GOOD
-#   erosion_scale  = 0.22  → Zero collapses   ✓ GOOD
-# Change these numbers if your best config was different
+# BPAnno Configuration 
+# dilation_scale = 0.40  → Ring mean ~9.7% 
+# erosion_scale  = 0.22  → Zero collapses  
 BPANNO_DIL_SCALE    = 0.40
 BPANNO_ERO_SCALE    = 0.22
 BPANNO_DP_RATIO     = 0.02   # Douglas-Peucker: 2% of perimeter
 BPANNO_MIN_VERTICES = 5
 BPANNO_MAX_VERTICES = 15
-# ─────────────────────────────────────────────────────────────
+
 
 
 def generate_bpanno(gt_np, dp_epsilon_ratio=BPANNO_DP_RATIO):
     """
     Generate BPAnno polygon masks from binary GT mask.
-    Creates REAL polygon shapes with straight edges (5-15 vertices).
-
+    Creates polygon shapes with straight edges (5-15 vertices).
     Uses SEPARATE dilation and erosion scales to compensate for
     polygon corner-cutting which would otherwise shrink the ring.
 
     Args:
-        gt_np           : (H,W) float [0,1] binary ground truth mask
-        dp_epsilon_ratio: Douglas-Peucker epsilon as fraction of perimeter
-                          0.02 = real polygon with ~6-15 straight-edge vertices
+        gt_np : (H,W) float [0,1] binary ground truth mask
+        dp_epsilon_ratio: Douglas-Peucker epsilon as fraction of perimeter 0.02 = real polygon with ~6-15 straight-edge vertices
 
     Returns:
-        y_in        : (H,W) float32 - inscribed polygon mask  (certain fg)
-        y_en        : (H,W) float32 - envelope polygon mask   (boundary enclosure)
-        omega_delta : (H,W) float32 - uncertain ring          (y_en - y_in)
-        y_c         : (H,W) int64   - 3-class CCG labels
+        y_in : (H,W) float32 - inscribed polygon mask(certain fg)
+        y_en : (H,W) float32 - envelope polygon mask(boundary enclosure)
+        omega_delta : (H,W) float32 - uncertain ring(y_en - y_in)
+        y_c : (H,W) int64   - 3-class CCG labels
                                       0 = certain background
                                       1 = uncertain ring
                                       2 = certain foreground
@@ -47,7 +43,7 @@ def generate_bpanno(gt_np, dp_epsilon_ratio=BPANNO_DP_RATIO):
     gt_u8 = (gt_np * 255).astype(np.uint8)
     H, W  = gt_np.shape
 
-    # ── Adaptive kernel sizes ─────────────────────────────────
+    # Adaptive kernel sizes 
     area = float(gt_u8.sum()) / 255.0
 
     if area > 10:
@@ -69,7 +65,7 @@ def generate_bpanno(gt_np, dp_epsilon_ratio=BPANNO_DP_RATIO):
     dilated = cv2.dilate(gt_u8, dil_kernel, iterations=1)   # envelope base
     eroded  = cv2.erode(gt_u8,  ero_kernel, iterations=1)   # inscribed base
 
-    # ── Convert contour to polygon mask ──────────────────────
+    # Convert contour to polygon mask 
     def to_poly_mask(binary_u8):
         """
         Finds the largest contour in binary_u8, applies Douglas-Peucker
@@ -94,7 +90,7 @@ def generate_bpanno(gt_np, dp_epsilon_ratio=BPANNO_DP_RATIO):
         epsilon = perimeter * dp_epsilon_ratio
         polygon = cv2.approxPolyDP(contour, epsilon, closed=True)
 
-        # Too many vertices → increase epsilon (more aggressive simplification)
+        # Too many vertices → increase epsilon(more aggressive simplification)
         attempts = 0
         while len(polygon) > BPANNO_MAX_VERTICES and attempts < 12:
             epsilon *= 1.25
@@ -111,30 +107,28 @@ def generate_bpanno(gt_np, dp_epsilon_ratio=BPANNO_DP_RATIO):
         # Need at least 3 points for a valid polygon
         if len(polygon) >= 3:
             cv2.fillPoly(out, [polygon], 255)
-
         return out
 
-    # ── Build polygon masks ───────────────────────────────────
+    # Build polygon masks
     y_en_u8 = to_poly_mask(dilated)
     y_in_u8 = to_poly_mask(eroded)
 
-    # Safety: if erosion collapsed to empty → use GT as inscribed
+    # if erosion collapsed to empty use GT as inscribed
     if y_in_u8.sum() == 0:
         y_in_u8 = gt_u8.copy()
 
-    # ── Convert to float32 ────────────────────────────────────
     y_en = (y_en_u8 > 127).astype(np.float32)
     y_in = (y_in_u8 > 127).astype(np.float32)
 
-    # Safety clamp: inscribed must be strictly inside envelope
+    #  inscribed must be strictly inside envelope
     # (polygon straight edges can occasionally push inscribed outside)
     y_in = y_in * y_en
 
     # Uncertain ring: inside envelope but outside inscribed
     omega_delta = np.clip(y_en - y_in, 0, 1).astype(np.float32)
 
-    # ── 3-class CCG label map ─────────────────────────────────
-    y_c            = np.zeros_like(y_in, dtype=np.int64)
+    # 3-class CCG label map
+    y_c = np.zeros_like(y_in, dtype=np.int64)
     y_c[y_en == 1] = 1    # inside envelope → uncertain (overwritten below)
     y_c[y_in == 1] = 2    # inside inscribed → certain fg (overrides ring)
     # pixels outside y_en stay 0 → certain bg

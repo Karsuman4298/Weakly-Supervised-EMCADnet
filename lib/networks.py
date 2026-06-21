@@ -112,10 +112,8 @@ class EMCADNet(nn.Module):
         # if grayscale input, convert to 3 channels
         if x.size()[1] == 1:
             x = self.conv(x)
-
         # encoder
         x1, x2, x3, x4 = self.backbone(x)
-
         # decoder
         dec_outs = self.decoder(x4, [x3, x2, x1])
         # dec_outs = [d4, d3, d2, d1]
@@ -135,7 +133,7 @@ class EMCADNet(nn.Module):
         if mode == 'test':
             return [p4, p3, p2, p1]
 
-        # ── BPAnno: extra heads only during training ──────────────────
+        # BPAnno: extra heads only during training
         H, W = x.shape[2], x.shape[3]
         d1 = dec_outs[3]  # finest decoder feature map
 
@@ -149,8 +147,6 @@ class EMCADNet(nn.Module):
         embeddings = F.interpolate(embeddings, size=(H, W),
                                    mode='bilinear', align_corners=False)
         embeddings = F.normalize(embeddings, dim=1)  # L2-normalize
-        # ─────────────────────────────────────────────────────────────
-
         return [p4, p3, p2, p1], cls_logits, embeddings
 
     @torch.no_grad()

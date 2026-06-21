@@ -14,11 +14,7 @@ from lib.networks import EMCADNet
 from utils.dataloader import get_loader as get_loader
 from utils.utils import clip_gradient, adjust_lr, AvgMeter, cal_params_flops
 
-
-# ═══════════════════════════════════════════════════════════════════
-#  BPAnno Loss Functions
-# ═══════════════════════════════════════════════════════════════════
-
+#  BPAnno Loss Function
 def dice_loss_masked(pred_prob, target, valid_mask=None, smooth=1e-6):
     if valid_mask is not None:
         pred_prob = pred_prob * valid_mask
@@ -36,7 +32,8 @@ def dual_mask_loss(seg_logit, y_in, y_en, use_edge=True):
         pred = pred.squeeze(1)
     L_in = dice_loss_masked(pred, y_in)
     L_en = dice_loss_masked(pred, y_en)
-    Lc   = L_in + L_en
+    Lc = L_in + L_en
+    #extra edge loss for better boundary prediction
     if use_edge:
         laplacian = torch.tensor(
             [[1,  1, 1],
@@ -45,10 +42,10 @@ def dual_mask_loss(seg_logit, y_in, y_en, use_edge=True):
             dtype=torch.float32,
             device=pred.device
         ).view(1, 1, 3, 3)
-        pred_4d   = pred.unsqueeze(1)
-        y_en_4d   = y_en.unsqueeze(1).float()
+        pred_4d = pred.unsqueeze(1)
+        y_en_4d = y_en.unsqueeze(1).float()
         pred_edge = F.conv2d(pred_4d,  laplacian, padding=1).squeeze(1)
-        gt_edge   = F.conv2d(y_en_4d, laplacian, padding=1).squeeze(1)
+        gt_edge = F.conv2d(y_en_4d, laplacian, padding=1).squeeze(1)
         edge_loss = F.l1_loss(pred_edge * y_en, gt_edge * y_en)
         Lc = Lc + 0.3 * edge_loss
     return Lc
@@ -71,16 +68,13 @@ def generate_pseudo_labels(seg_logit, cls_logits, omega_delta,
     cls_pred = cls_prob.argmax(dim=1)
     p_bg = cls_prob[:, 0]
     p_fg = cls_prob[:, 2]
-    U_c  = (p_fg >= p_bg).long()
+    U_c = (p_fg >= p_bg).long()
     U_c[cls_pred == 0] = 0
     U_c[cls_pred == 2] = 1
     seg_fg_in_ring = (seg_prob >= 0.5) & (omega_delta == 1)
     U_c[seg_fg_in_ring] = 1
     eps = 1e-6
-    entropy = -(
-        seg_prob       * torch.log(seg_prob       + eps) +
-        (1 - seg_prob) * torch.log(1 - seg_prob   + eps)
-    )
+    entropy = -(seg_prob * torch.log(seg_prob + eps) + (1 - seg_prob) * torch.log(1 - seg_prob + eps))
     U_e = torch.zeros_like(U_c)
     U_e[entropy >= entropy_thresh] = -1
     U = torch.clamp(U_c + 2 * U_e, min=-1)
@@ -93,26 +87,23 @@ def contrastive_loss_ccl(embeddings, seg_logit, pseudo_labels,
                           omega_delta, y_in, y_en, neg_queue,
                           temperature=0.1, hard_ratio=0.7,
                           num_anchors=100, pixel_pool=512):
-    # ── CRITICAL: detach queue so it never enters the grad graph ──
+    # detach queue so it never enters the grad graph
     neg_queue = neg_queue.detach()
 
     B, D, H, W = embeddings.shape
     device = embeddings.device
-
     seg_pred = (torch.sigmoid(seg_logit.detach()).squeeze(1) >= 0.5).long()
-
     y_hat = seg_pred.clone()
     for b in range(B):
         valid = (omega_delta[b] == 1) & (pseudo_labels[b] != -1)
         y_hat[b][valid] = pseudo_labels[b][valid]
 
-    certain_fg   = (y_in  == 1)
-    certain_bg   = (y_en  == 0) & (omega_delta == 0)
-    certain_gt   = torch.zeros_like(seg_pred)
+    certain_fg = (y_in == 1)
+    certain_bg = (y_en == 0) & (omega_delta == 0)
+    certain_gt = torch.zeros_like(seg_pred)
     certain_gt[certain_fg] = 1
     certain_gt[certain_bg] = 0
     certain_mask = (omega_delta == 0)
-
     all_anchor_embs = []
     all_anchor_lbls = []
     all_pixel_embs  = []
@@ -136,7 +127,7 @@ def contrastive_loss_ccl(embeddings, seg_logit, pseudo_labels,
 
         h_sel = h_idx[torch.randperm(len(h_idx), device=device)[:n_h]]
         e_sel = e_idx[torch.randperm(len(e_idx), device=device)[:n_e]]
-        anc   = torch.cat([h_sel, e_sel], dim=0)
+        anc = torch.cat([h_sel, e_sel], dim=0)
 
         ah, aw = anc[:, 0], anc[:, 1]
         all_anchor_embs.append(embeddings[b, :, ah, aw].T)
@@ -144,7 +135,7 @@ def contrastive_loss_ccl(embeddings, seg_logit, pseudo_labels,
 
         flat_emb = embeddings[b].reshape(D, -1).T
         flat_lbl = y_hat[b].reshape(-1)
-        pool_n   = min(pixel_pool, H * W)
+        pool_n = min(pixel_pool, H * W)
         pool_idx = torch.randperm(H * W, device=device)[:pool_n]
         all_pixel_embs.append(flat_emb[pool_idx])
         all_pixel_lbls.append(flat_lbl[pool_idx])
@@ -152,16 +143,16 @@ def contrastive_loss_ccl(embeddings, seg_logit, pseudo_labels,
     if len(all_anchor_embs) == 0:
         return torch.tensor(0.0, device=device, requires_grad=True)
 
-    anc_emb  = torch.cat(all_anchor_embs, dim=0)
-    anc_lbl  = torch.cat(all_anchor_lbls, dim=0)
-    pix_emb  = torch.cat(all_pixel_embs,  dim=0)
-    pix_lbl  = torch.cat(all_pixel_lbls,  dim=0)
+    anc_emb = torch.cat(all_anchor_embs, dim=0)
+    anc_lbl = torch.cat(all_anchor_lbls, dim=0)
+    pix_emb = torch.cat(all_pixel_embs,  dim=0)
+    pix_lbl = torch.cat(all_pixel_lbls,  dim=0)
 
-    sim_pos_pool  = torch.mm(anc_emb, pix_emb.T) / temperature
+    sim_pos_pool = torch.mm(anc_emb, pix_emb.T) / temperature
     sim_neg_queue = torch.mm(anc_emb, neg_queue)  / temperature
-    neg_denom     = torch.exp(sim_neg_queue).sum(dim=1)
+    neg_denom = torch.exp(sim_neg_queue).sum(dim=1)
 
-    total_loss  = torch.tensor(0.0, device=device)
+    total_loss = torch.tensor(0.0, device=device)
     valid_count = 0
 
     for i in range(len(anc_emb)):
@@ -172,26 +163,22 @@ def contrastive_loss_ccl(embeddings, seg_logit, pseudo_labels,
         if pos_mask.sum() == 0:
             continue
         pos_sim = torch.exp(sim_pos_pool[i][pos_mask]).mean()
-        denom   = pos_sim + neg_denom[i]
-        loss_i  = -torch.log(pos_sim / (denom + 1e-6))
-        total_loss  = total_loss + loss_i
+        denom = pos_sim + neg_denom[i]
+        loss_i = -torch.log(pos_sim / (denom + 1e-6))
+        total_loss = total_loss + loss_i
         valid_count += 1
 
     return total_loss / max(valid_count, 1)
 
-
-# ═══════════════════════════════════════════════════════════════════
-#  Metrics
-# ═══════════════════════════════════════════════════════════════════
 
 def dice_coefficient(predicted, labels):
     if predicted.device != labels.device:
         labels = labels.to(predicted.device)
     smooth = 1e-6
     predicted_flat = predicted.contiguous().view(-1)
-    labels_flat    = labels.contiguous().view(-1)
-    intersection   = (predicted_flat * labels_flat).sum()
-    total          = predicted_flat.sum() + labels_flat.sum()
+    labels_flat = labels.contiguous().view(-1)
+    intersection = (predicted_flat * labels_flat).sum()
+    total = predicted_flat.sum() + labels_flat.sum()
     return (2. * intersection + smooth) / (total + smooth)
 
 
@@ -200,20 +187,16 @@ def iou(predicted, labels):
         labels = labels.to(predicted.device)
     smooth = 1e-6
     predicted_flat = predicted.contiguous().view(-1)
-    labels_flat    = labels.contiguous().view(-1)
-    intersection   = (predicted_flat * labels_flat).sum()
-    union          = predicted_flat.sum() + labels_flat.sum() - intersection
+    labels_flat = labels.contiguous().view(-1)
+    intersection = (predicted_flat * labels_flat).sum()
+    union = predicted_flat.sum() + labels_flat.sum() - intersection
     return (intersection + smooth) / (union + smooth)
 
 
-# ═══════════════════════════════════════════════════════════════════
-#  Test function
-# ═══════════════════════════════════════════════════════════════════
-
 def test(model, path, dataset, opt):
-    data_path  = os.path.join(path, dataset)
+    data_path = os.path.join(path, dataset)
     image_root = f'{data_path}/images/'
-    gt_root    = f'{data_path}/masks/'
+    gt_root = f'{data_path}/masks/'
     model.eval()
 
     test_loader = get_loader(
@@ -225,14 +208,14 @@ def test(model, path, dataset, opt):
         augmentation=False
     )
 
-    DSC          = 0.0
-    IOU          = 0.0
+    DSC = 0.0
+    IOU = 0.0
     total_images = 0
 
     with torch.no_grad():
         for pack in test_loader:
             images = pack[0].cuda()
-            gts    = pack[5].cuda().float()
+            gts = pack[5].cuda().float()
 
             ress = model(images, mode='test')
             if not isinstance(ress, list):
@@ -240,21 +223,18 @@ def test(model, path, dataset, opt):
             predictions = ress[-1]
 
             for idx in range(len(images)):
-                p             = predictions[idx].unsqueeze(0)
+                p = predictions[idx].unsqueeze(0)
                 pred_resized  = torch.sigmoid(p).squeeze()
-                gt_resized    = gts[idx].squeeze()
-                input_binary  = (pred_resized >= 0.5).float()
+                gt_resized = gts[idx].squeeze()
+                input_binary = (pred_resized >= 0.5).float()
                 target_binary = (gt_resized   >= 0.5).float()
-                DSC          += dice_coefficient(input_binary, target_binary).item()
-                IOU          += iou(input_binary, target_binary).item()
+                DSC += dice_coefficient(input_binary, target_binary).item()
+                IOU += iou(input_binary, target_binary).item()
                 total_images += 1
 
     return DSC / total_images, IOU / total_images, total_images
 
 
-# ═══════════════════════════════════════════════════════════════════
-#  Train function
-# ═══════════════════════════════════════════════════════════════════
 
 def train(train_loader, model, optimizer, epoch, opt, model_name):
     model.train()
@@ -273,51 +253,51 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
         for rate in size_rates:
             optimizer.zero_grad()
 
-            # ── Move to GPU ───────────────────────────────────────────
-            images      = Variable(images).cuda()
-            y_in        = y_in.float().cuda()
-            y_en        = y_en.float().cuda()
+           # move to gpu
+            images = Variable(images).cuda()
+            y_in = y_in.float().cuda()
+            y_en = y_en.float().cuda()
             omega_delta = omega_delta.float().cuda()
-            y_c         = y_c.long().cuda()
-            gts         = Variable(gts).float().cuda()
+            y_c = y_c.long().cuda()
+            gts = Variable(gts).float().cuda()
 
-            # ── Multi-scale resize ────────────────────────────────────
+            # Multi-scale resize 
             if rate != 1:
                 trainsize = int(round(opt.img_size * rate / 32) * 32)
-                images    = F.interpolate(
+                images = F.interpolate(
                     images,
                     size=(trainsize, trainsize),
                     mode='bilinear',
                     align_corners=True
                 )
 
-            # ── Forward pass ──────────────────────────────────────────
+            # Forward pass 
             P, cls_logits, embeddings = model(images, mode='train')
 
             if not isinstance(P, list):
                 P = [P]
 
-            # ── Resize helper ─────────────────────────────────────────
+            # Resize helper
             def resize_mask(m, size):
                 return F.interpolate(
                     m.unsqueeze(1).float(), size=size, mode='nearest'
                 ).squeeze(1)
 
             target_size = P[0].shape[2:]
-            y_in_r      = resize_mask(y_in, target_size)
-            y_en_r      = resize_mask(y_en, target_size)
+            y_in_r = resize_mask(y_in, target_size)
+            y_en_r = resize_mask(y_en, target_size)
 
-            # ── Lc: dual-mask Dice on 4 heads + ensemble ──────────────
+            # Lc: dual-mask Dice on 4 heads + ensemble
             seg_ensemble = P[0] + P[1] + P[2] + P[3]
             loss = (
-                dual_mask_loss(P[0],         y_in_r, y_en_r) +
-                dual_mask_loss(P[1],         y_in_r, y_en_r) +
-                dual_mask_loss(P[2],         y_in_r, y_en_r) +
-                dual_mask_loss(P[3],         y_in_r, y_en_r) +
+                dual_mask_loss(P[0],y_in_r, y_en_r) +
+                dual_mask_loss(P[1],y_in_r, y_en_r) +
+                dual_mask_loss(P[2],y_in_r, y_en_r) +
+                dual_mask_loss(P[3],y_in_r, y_en_r) +
                 dual_mask_loss(seg_ensemble, y_in_r, y_en_r)
             )
 
-            # ── CCG + CCL (after warmup) ──────────────────────────────
+            # CCG + CCL (after warmup)
             # Snapshot embeddings NOW (before backward) so queue update
             # can happen safely AFTER backward without holding the graph.
             emb_snapshot = None
@@ -325,10 +305,9 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
             if use_ccg_ccl:
                 H_img = images.shape[2]
                 W_img = images.shape[3]
-
-                y_in_full = resize_mask(y_in,        (H_img, W_img))
-                y_en_full = resize_mask(y_en,        (H_img, W_img))
-                od_full   = resize_mask(omega_delta,  (H_img, W_img))
+                y_in_full = resize_mask(y_in,(H_img, W_img))
+                y_en_full = resize_mask(y_en,(H_img, W_img))
+                od_full   = resize_mask(omega_delta,(H_img, W_img))
                 y_c_full  = F.interpolate(
                     y_c.unsqueeze(1).float(),
                     size=(H_img, W_img),
@@ -336,12 +315,11 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
                 ).squeeze(1).long()
 
                 Lce = classification_loss_ccg(cls_logits, y_c_full)
-
                 pseudo = generate_pseudo_labels(
                     P[-1].detach(), cls_logits.detach(), od_full
                 )
 
-                # ── CRITICAL FIX 1: pass detached clone of queue ──────
+                # pass detached clone of queue
                 LPCL = contrastive_loss_ccl(
                     embeddings,
                     P[-1].detach(),
@@ -358,15 +336,13 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
 
                 loss = loss + opt.lambda1 * LPCL + opt.lambda2 * Lce
 
-                # ── CRITICAL FIX 2: snapshot BEFORE backward ──────────
+                # snapshot BEFORE backward
                 emb_snapshot = embeddings.detach().permute(
                     0, 2, 3, 1
                 ).reshape(-1, model.embed_dim)
-
-            # ── Backward ─────────────────────────────────────────────
             loss.backward()
 
-            # ── CRITICAL FIX 3: update queue AFTER backward ───────────
+            # update queue AFTER backward
             if emb_snapshot is not None:
                 with torch.no_grad():
                     idx = torch.randperm(
@@ -375,7 +351,7 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
                     )[:64]
                     model.update_queue(emb_snapshot[idx])
 
-            # ── Optimizer step ────────────────────────────────────────
+
             clip_gradient(optimizer, opt.clip)
             optimizer.step()
 
@@ -421,9 +397,7 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
                    os.path.join(save_path, f"{model_name}-best.pth"))
 
 
-# ═══════════════════════════════════════════════════════════════════
-#  Main
-# ═══════════════════════════════════════════════════════════════════
+
 
 if __name__ == '__main__':
     dataset_name = 'ClinicDB'
@@ -446,9 +420,9 @@ if __name__ == '__main__':
     parser.add_argument('--epoch', type=int, default=200)
     parser.add_argument('--lr', type=float, default=0.0005)
     parser.add_argument('--alpha', type=float, default=0.3)
-    parser.add_argument('--lambda1', type=float, default=0.3,
+    parser.add_argument('--lambda1', type=float, default=0.3, ##according to the paper EAUWSeg, 0.3 is the best value for lambda1
                         help='weight for contrastive loss LPCL')
-    parser.add_argument('--lambda2', type=float, default=0.5,
+    parser.add_argument('--lambda2', type=float, default=0.5,###according to the paper EAUWSeg, 0.5 is the best value for lambda2
                         help='weight for classification loss Lce')
     parser.add_argument('--batchsize', type=int, default=8)
     parser.add_argument('--test_batchsize', type=int, default=8)
@@ -505,16 +479,16 @@ if __name__ == '__main__':
         )
 
         model = EMCADNet(
-            num_classes      = 1,
-            kernel_sizes     = opt.kernel_sizes,
+            num_classes = 1,
+            kernel_sizes = opt.kernel_sizes,
             expansion_factor = opt.expansion_factor,
-            dw_parallel      = not opt.no_dw_parallel,
-            add              = not opt.concatenation,
-            lgag_ks          = opt.lgag_ks,
-            activation       = opt.activation_mscb,
-            encoder          = opt.encoder,
-            pretrain         = not opt.no_pretrain,
-            pretrained_dir   = opt.pretrained_dir
+            dw_parallel = not opt.no_dw_parallel,
+            add = not opt.concatenation,
+            lgag_ks = opt.lgag_ks,
+            activation = opt.activation_mscb,
+            encoder = opt.encoder,
+            pretrain = not opt.no_pretrain,
+            pretrained_dir = opt.pretrained_dir
         )
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -543,14 +517,14 @@ if __name__ == '__main__':
         )
 
         train_loader = get_loader(
-            image_root   = f'{opt.train_path}/images/',
-            gt_root      = f'{opt.train_path}/masks/',
-            batchsize    = opt.batchsize,
-            trainsize    = opt.img_size,
-            shuffle      = True,
+            image_root = f'{opt.train_path}/images/',
+            gt_root = f'{opt.train_path}/masks/',
+            batchsize = opt.batchsize,
+            trainsize = opt.img_size,
+            shuffle = True,
             augmentation = opt.augmentation,
-            split        = 'train',
-            color_image  = opt.color_image
+            split = 'train',
+            color_image = opt.color_image
         )
 
         for epoch in range(1, opt.epoch + 1):
