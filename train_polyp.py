@@ -62,7 +62,8 @@ def classification_loss_ccg(cls_logits, y_c):
 
 
 @torch.no_grad()
-def generate_pseudo_labels(seg_logit, cls_logits, omega_delta, entropy_thresh=0.5):
+def generate_pseudo_labels(seg_logit, cls_logits, omega_delta,
+                            entropy_thresh=0.5):
     seg_prob = torch.sigmoid(seg_logit)
     if seg_prob.dim() == 4:
         seg_prob = seg_prob.squeeze(1)
@@ -92,15 +93,11 @@ def contrastive_loss_ccl(embeddings, seg_logit, pseudo_labels,
                           omega_delta, y_in, y_en, neg_queue,
                           temperature=0.1, hard_ratio=0.7,
                           num_anchors=100, pixel_pool=512):
-    """
-    LPCL: pixel-wise contrastive loss with hard-sample mining.
-    neg_queue must be passed as .detach().clone() by the caller.
-    """
+    # ── CRITICAL: detach queue so it never enters the grad graph ──
+    neg_queue = neg_queue.detach()
+
     B, D, H, W = embeddings.shape
     device = embeddings.device
-
-    # Always detach queue inside function as safety guarantee
-    neg_queue = neg_queue.detach()
 
     seg_pred = (torch.sigmoid(seg_logit.detach()).squeeze(1) >= 0.5).long()
 
@@ -234,7 +231,6 @@ def test(model, path, dataset, opt):
 
     with torch.no_grad():
         for pack in test_loader:
-            # pack = (images, y_in, y_en, omega_delta, y_c, gts)
             images = pack[0].cuda()
             gts    = pack[5].cuda().float()
 
@@ -269,10 +265,10 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
     size_rates  = [0.75, 1, 1.25]
     total_step  = len(train_loader)
 
-    # BPAnno staged training: CCG+CCL activate after 30% of epochs
     use_ccg_ccl = (epoch > int(0.3 * opt.epoch))
 
-    for i, (images, y_in, y_en, omega_delta, y_c, gts) in enumerate(train_loader, start=1):
+    for i, (images, y_in, y_en, omega_delta, y_c, gts) in enumerate(
+            train_loader, start=1):
 
         for rate in size_rates:
             optimizer.zero_grad()
@@ -301,17 +297,17 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
             if not isinstance(P, list):
                 P = [P]
 
-            # ── Helper: resize BPAnno masks ───────────────────────────
+            # ── Resize helper ─────────────────────────────────────────
             def resize_mask(m, size):
                 return F.interpolate(
                     m.unsqueeze(1).float(), size=size, mode='nearest'
                 ).squeeze(1)
 
             target_size = P[0].shape[2:]
-            y_in_r      = resize_mask(y_in,  target_size)
-            y_en_r      = resize_mask(y_en,  target_size)
+            y_in_r      = resize_mask(y_in, target_size)
+            y_en_r      = resize_mask(y_en, target_size)
 
-            # ── Lc: dual-mask Dice on all 4 heads + ensemble ──────────
+            # ── Lc: dual-mask Dice on 4 heads + ensemble ──────────────
             seg_ensemble = P[0] + P[1] + P[2] + P[3]
             loss = (
                 dual_mask_loss(P[0],         y_in_r, y_en_r) +
@@ -322,32 +318,30 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
             )
 
             # ── CCG + CCL (after warmup) ──────────────────────────────
-            # Store embeddings snapshot BEFORE backward for queue update
-            emb_for_queue = None
+            # Snapshot embeddings NOW (before backward) so queue update
+            # can happen safely AFTER backward without holding the graph.
+            emb_snapshot = None
 
             if use_ccg_ccl:
                 H_img = images.shape[2]
                 W_img = images.shape[3]
 
-                y_in_full = resize_mask(y_in,       (H_img, W_img))
-                y_en_full = resize_mask(y_en,       (H_img, W_img))
-                od_full   = resize_mask(omega_delta, (H_img, W_img))
+                y_in_full = resize_mask(y_in,        (H_img, W_img))
+                y_en_full = resize_mask(y_en,        (H_img, W_img))
+                od_full   = resize_mask(omega_delta,  (H_img, W_img))
                 y_c_full  = F.interpolate(
                     y_c.unsqueeze(1).float(),
                     size=(H_img, W_img),
                     mode='nearest'
                 ).squeeze(1).long()
 
-                # Lce: classification loss
                 Lce = classification_loss_ccg(cls_logits, y_c_full)
 
-                # Pseudo labels
                 pseudo = generate_pseudo_labels(
                     P[-1].detach(), cls_logits.detach(), od_full
                 )
 
-                # LPCL: contrastive loss
-                # Pass detached clone of queue — avoids inplace grad conflict
+                # ── CRITICAL FIX 1: pass detached clone of queue ──────
                 LPCL = contrastive_loss_ccl(
                     embeddings,
                     P[-1].detach(),
@@ -355,7 +349,7 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
                     od_full,
                     y_in_full,
                     y_en_full,
-                    model.neg_queue.detach().clone(),  # KEY FIX
+                    model.neg_queue.detach().clone(),  # detached clone
                     temperature=0.1,
                     hard_ratio=0.7,
                     num_anchors=100,
@@ -364,24 +358,22 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
 
                 loss = loss + opt.lambda1 * LPCL + opt.lambda2 * Lce
 
-                # Snapshot embeddings for queue update AFTER backward
-                # Must be detached so it does not hold graph references
-                emb_for_queue = embeddings.detach().permute(0, 2, 3, 1).reshape(
-                    -1, model.embed_dim
-                )
-                
+                # ── CRITICAL FIX 2: snapshot BEFORE backward ──────────
+                emb_snapshot = embeddings.detach().permute(
+                    0, 2, 3, 1
+                ).reshape(-1, model.embed_dim)
+
+            # ── Backward ─────────────────────────────────────────────
             loss.backward()
 
-            # ── Update memory queue AFTER backward ───────────────────
-            # This is the correct order — queue update must NOT happen
-            # before backward() because it modifies neg_queue inplace
-            if emb_for_queue is not None:
+            # ── CRITICAL FIX 3: update queue AFTER backward ───────────
+            if emb_snapshot is not None:
                 with torch.no_grad():
                     idx = torch.randperm(
-                        emb_for_queue.shape[0],
-                        device=emb_for_queue.device
+                        emb_snapshot.shape[0],
+                        device=emb_snapshot.device
                     )[:64]
-                    model.update_queue(emb_for_queue[idx])
+                    model.update_queue(emb_snapshot[idx])
 
             # ── Optimizer step ────────────────────────────────────────
             clip_gradient(optimizer, opt.clip)
@@ -399,13 +391,11 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
 
     total_train_time += (time.time() - epoch_start)
 
-    # Save last checkpoint
     save_path = opt.train_save
     os.makedirs(save_path, exist_ok=True)
     torch.save(model.state_dict(),
                os.path.join(save_path, f"{model_name}-last.pth"))
 
-    # Validation + test evaluation
     epoch_results = {}
     for ds in ['test', 'val']:
         d_dice, d_iou, _ = test(model, opt.test_path, ds, opt)
@@ -416,7 +406,6 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
               f'Dice: {d_dice:.4f}, IoU: {d_iou:.4f}')
         dict_plot[ds].append(d_dice)
 
-    # Save best checkpoint
     if epoch_results['val'] > best:
         logging.info(
             f"### Best Model Saved "
@@ -442,13 +431,17 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--encoder', type=str, default='pvt_v2_b2')
     parser.add_argument('--expansion_factor', type=int, default=2)
-    parser.add_argument('--kernel_sizes', type=int, nargs='+', default=[1, 3, 5])
+    parser.add_argument('--kernel_sizes', type=int, nargs='+',
+                        default=[1, 3, 5])
     parser.add_argument('--lgag_ks', type=int, default=3)
     parser.add_argument('--activation_mscb', type=str, default='relu6')
-    parser.add_argument('--no_dw_parallel', action='store_true', default=False)
-    parser.add_argument('--concatenation', action='store_true', default=False)
+    parser.add_argument('--no_dw_parallel', action='store_true',
+                        default=False)
+    parser.add_argument('--concatenation', action='store_true',
+                        default=False)
     parser.add_argument('--no_pretrain', action='store_true', default=False)
-    parser.add_argument('--pretrained_dir', type=str, default='./pretrained_pth/pvt/')
+    parser.add_argument('--pretrained_dir', type=str,
+                        default='./pretrained_pth/pvt/')
     parser.add_argument('--supervision', type=str, default='mutation')
     parser.add_argument('--epoch', type=int, default=200)
     parser.add_argument('--lr', type=float, default=0.0005)
@@ -471,7 +464,7 @@ if __name__ == '__main__':
                         default=f'./data/polyp/target/{dataset_name}/')
     parser.add_argument('--train_save', type=str, default='')
     parser.add_argument('--resume', type=str, default='',
-                        help='path to checkpoint .pth to resume from')
+                        help='path to .pth checkpoint to resume from')
 
     opt = parser.parse_args()
 
@@ -511,7 +504,6 @@ if __name__ == '__main__':
             force=True
         )
 
-        # Build model
         model = EMCADNet(
             num_classes      = 1,
             kernel_sizes     = opt.kernel_sizes,
@@ -536,7 +528,7 @@ if __name__ == '__main__':
                 model.load_state_dict(ckpt['model'])
             else:
                 model.load_state_dict(ckpt)
-            print("Checkpoint loaded successfully")
+            print("Checkpoint loaded")
         elif opt.resume:
             print(f"WARNING: checkpoint not found at {opt.resume}")
 
@@ -562,7 +554,8 @@ if __name__ == '__main__':
         )
 
         for epoch in range(1, opt.epoch + 1):
-            adjust_lr(optimizer, opt.lr, epoch, opt.decay_rate, opt.decay_epoch)
+            adjust_lr(optimizer, opt.lr, epoch,
+                      opt.decay_rate, opt.decay_epoch)
             train(train_loader, model, optimizer, epoch, opt, run_id)
             scheduler.step()
 
