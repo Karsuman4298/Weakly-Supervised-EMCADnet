@@ -1,545 +1,551 @@
+# train_polyp.py  — MRPAnno version
+#
+# Supervision comes ONLY from polygon-derived masks.
+# GT mask is NEVER passed to any loss function.
+#
+# Loss breakdown
+# ──────────────
+# L_seg    : weighted multi-zone Dice+BCE on {Ω_I, Ω_Δ1, Ω_Δ2, Ω_O}
+#            using soft labels for the two uncertain bands
+# L_bound  : KL divergence across P_mid strip (boundary consistency)
+# L_ce5    : cross-entropy for 5-class CCG head
+# L_pcl    : pixel contrastive learning (MRPAnno hard-sample selection)
+#
+# L = L_seg + λ1*L_pcl + λ2*L_ce5 + λ3*L_bound
+
 import os
 import time
-import logging
-import argparse
-from datetime import datetime
-
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Variable
-from torch.optim.lr_scheduler import CosineAnnealingLR
+import numpy as np
+import pandas as pd
+import cv2
+import argparse
+from tqdm import tqdm
+
 from lib.networks import EMCADNet
-from utils.dataloader import get_loader as get_loader
-from utils.utils import clip_gradient, adjust_lr, AvgMeter, cal_params_flops
-
-#  BPAnno Loss Function
-def dice_loss_masked(pred_prob, target, valid_mask=None, smooth=1e-6):
-    if valid_mask is not None:
-        pred_prob = pred_prob * valid_mask
-        target    = target    * valid_mask
-    p = pred_prob.reshape(pred_prob.shape[0], -1)
-    t = target.reshape(target.shape[0], -1).float()
-    inter = (p * t).sum(dim=1)
-    denom = p.sum(dim=1) + t.sum(dim=1)
-    return (1 - (2 * inter + smooth) / (denom + smooth)).mean()
+from utils.dataloader_polyp import get_loader, ALPHA, BETA
+from medpy.metric.binary import hd95
 
 
-def dual_mask_loss(seg_logit, y_in, y_en, use_edge=True):
-    pred = torch.sigmoid(seg_logit)
-    if pred.dim() == 4:
-        pred = pred.squeeze(1)
-    L_in = dice_loss_masked(pred, y_in)
-    L_en = dice_loss_masked(pred, y_en)
-    Lc = L_in + L_en
-    #extra edge loss for better boundary prediction
-    if use_edge:
-        laplacian = torch.tensor(
-            [[1,  1, 1],
-             [1, -8, 1],
-             [1,  1, 1]],
-            dtype=torch.float32,
-            device=pred.device
-        ).view(1, 1, 3, 3)
-        pred_4d = pred.unsqueeze(1)
-        y_en_4d = y_en.unsqueeze(1).float()
-        pred_edge = F.conv2d(pred_4d,  laplacian, padding=1).squeeze(1)
-        gt_edge = F.conv2d(y_en_4d, laplacian, padding=1).squeeze(1)
-        edge_loss = F.l1_loss(pred_edge * y_en, gt_edge * y_en)
-        Lc = Lc + 0.3 * edge_loss
-    return Lc
+# ─────────────────────────────────────────────────────────────
+# Metric helpers  (unchanged from original)
+# ─────────────────────────────────────────────────────────────
+
+def dice_coefficient(pred, label):
+    if pred.device != label.device:
+        label = label.to(pred.device)
+    smooth = 1e-6
+    p = pred.contiguous().view(-1)
+    l = label.contiguous().view(-1)
+    return (2. * (p * l).sum() + smooth) / (p.sum() + l.sum() + smooth)
 
 
-def classification_loss_ccg(cls_logits, y_c):
-    B, C, H, W = cls_logits.shape
-    logits_flat = cls_logits.permute(0, 2, 3, 1).reshape(-1, C)
-    labels_flat = y_c.reshape(-1)
-    return F.cross_entropy(logits_flat, labels_flat)
+def iou_score(pred, label):
+    if pred.device != label.device:
+        label = label.to(pred.device)
+    smooth = 1e-6
+    p = pred.contiguous().view(-1)
+    l = label.contiguous().view(-1)
+    inter = (p * l).sum()
+    union = p.sum() + l.sum() - inter
+    return (inter + smooth) / (union + smooth)
 
 
-@torch.no_grad()
-def generate_pseudo_labels(seg_logit, cls_logits, omega_delta,
-                            entropy_thresh=0.5):
-    seg_prob = torch.sigmoid(seg_logit)
-    if seg_prob.dim() == 4:
-        seg_prob = seg_prob.squeeze(1)
-    cls_prob = F.softmax(cls_logits, dim=1)
-    cls_pred = cls_prob.argmax(dim=1)
-    p_bg = cls_prob[:, 0]
-    p_fg = cls_prob[:, 2]
-    U_c = (p_fg >= p_bg).long()
-    U_c[cls_pred == 0] = 0
-    U_c[cls_pred == 2] = 1
-    seg_fg_in_ring = (seg_prob >= 0.5) & (omega_delta == 1)
-    U_c[seg_fg_in_ring] = 1
-    eps = 1e-6
-    entropy = -(seg_prob * torch.log(seg_prob + eps) + (1 - seg_prob) * torch.log(1 - seg_prob + eps))
-    U_e = torch.zeros_like(U_c)
-    U_e[entropy >= entropy_thresh] = -1
-    U = torch.clamp(U_c + 2 * U_e, min=-1)
-    U = U * omega_delta.long()
-    U[omega_delta == 0] = -1
-    return U
+def get_binary_metrics(pred, gt):
+    tp = (pred * gt).sum().item()
+    tn = ((1 - pred) * (1 - gt)).sum().item()
+    fp = (pred * (1 - gt)).sum().item()
+    fn = ((1 - pred) * gt).sum().item()
+    sens = tp / (tp + fn + 1e-8)
+    spec = tn / (tn + fp + 1e-8)
+    prec = tp / (tp + fp + 1e-8)
+    try:
+        hd_val = hd95(pred.cpu().numpy(), gt.cpu().numpy()) \
+            if pred.sum() > 0 and gt.sum() > 0 else 100.0
+    except Exception:
+        hd_val = 100.0
+    return sens, spec, prec, hd_val
 
 
-def contrastive_loss_ccl(embeddings, seg_logit, pseudo_labels,
-                          omega_delta, y_in, y_en, neg_queue,
-                          temperature=0.1, hard_ratio=0.7,
-                          num_anchors=100, pixel_pool=512):
-    # detach queue so it never enters the grad graph
-    neg_queue = neg_queue.detach()
+# ─────────────────────────────────────────────────────────────
+# Soft Dice loss  (supports soft float targets)
+# ─────────────────────────────────────────────────────────────
 
+def soft_dice_loss(pred_prob, soft_target, mask=None):
+    """
+    pred_prob  : (B,H,W) sigmoid probability
+    soft_target: (B,H,W) float target in [0,1]
+    mask       : (B,H,W) bool — pixels to include (None = all)
+    """
+    smooth = 1e-6
+    if mask is not None:
+        pred_prob   = pred_prob[mask]
+        soft_target = soft_target[mask]
+    inter = (pred_prob * soft_target).sum()
+    denom = pred_prob.sum() + soft_target.sum()
+    return 1.0 - (2.0 * inter + smooth) / (denom + smooth)
+
+
+def soft_bce_loss(pred_logit, soft_target, mask=None):
+    """
+    pred_logit : (B,H,W) raw logit
+    soft_target: (B,H,W) float target in [0,1]
+    """
+    loss = F.binary_cross_entropy_with_logits(
+        pred_logit, soft_target, reduction='none'
+    )
+    if mask is not None:
+        loss = loss[mask]
+    return loss.mean()
+
+
+# ─────────────────────────────────────────────────────────────
+# MRPAnno segmentation loss  L_seg
+# ─────────────────────────────────────────────────────────────
+
+def mrpanno_seg_loss(pred_logit, y_in, y_out,
+                     omega_d1, omega_d2, softlabel,
+                     alpha=ALPHA, beta=BETA):
+    """
+    Weighted multi-zone Dice + BCE.
+
+    Zones and their targets
+    ───────────────────────
+    Ω_I  (y_in==1)           → target 1.0,  weight 1.0
+    Ω_O  (y_out==0)          → target 0.0,  weight 1.0
+    Ω_Δ1 (omega_d1==1)       → target softlabel (≈0.7 avg), weight α
+    Ω_Δ2 (omega_d2==1)       → target softlabel (≈0.3 avg), weight β
+
+    GT is NEVER used here. All targets come from polygon masks.
+    """
+    p_sig  = torch.sigmoid(pred_logit)   # (B,H,W)
+
+    # ── Certain foreground: Ω_I ───────────────────────────────
+    mask_in  = y_in.bool()
+    tgt_in   = torch.ones_like(p_sig)
+    loss_in  = (soft_dice_loss(p_sig, tgt_in, mask_in) +
+                soft_bce_loss(pred_logit, tgt_in, mask_in))
+
+    # ── Certain background: Ω_O ───────────────────────────────
+    mask_out = (~y_out.bool())
+    tgt_out  = torch.zeros_like(p_sig)
+    loss_out = (soft_dice_loss(p_sig, tgt_out, mask_out) +
+                soft_bce_loss(pred_logit, tgt_out, mask_out))
+
+    # ── Inner uncertain: Ω_Δ1 ────────────────────────────────
+    mask_d1  = omega_d1.bool()
+    loss_d1  = 0.0
+    if mask_d1.any():
+        tgt_d1  = softlabel.clamp(0.5, 1.0)   # Ω_Δ1 is likely FG
+        loss_d1 = (soft_dice_loss(p_sig, tgt_d1, mask_d1) +
+                   soft_bce_loss(pred_logit, tgt_d1, mask_d1))
+
+    # ── Outer uncertain: Ω_Δ2 ────────────────────────────────
+    mask_d2  = omega_d2.bool()
+    loss_d2  = 0.0
+    if mask_d2.any():
+        tgt_d2  = softlabel.clamp(0.0, 0.5)   # Ω_Δ2 is likely BG
+        loss_d2 = (soft_dice_loss(p_sig, tgt_d2, mask_d2) +
+                   soft_bce_loss(pred_logit, tgt_d2, mask_d2))
+
+    return loss_in + loss_out + alpha * loss_d1 + beta * loss_d2
+
+
+# ─────────────────────────────────────────────────────────────
+# Boundary consistency loss  L_bound
+# ─────────────────────────────────────────────────────────────
+
+def boundary_consistency_loss(pred_logit, pmid_strip,
+                              omega_d1, omega_d2):
+    """
+    For every pixel in the P_mid strip, push the prediction to
+    be more confident than its neighbours across the strip.
+
+    Implementation: minimise prediction entropy inside the strip
+    (the model should be either foreground or background — not 0.5).
+    Additionally enforce that Ω_Δ1 side > Ω_Δ2 side via a margin loss.
+    """
+    p_sig  = torch.sigmoid(pred_logit)   # (B,H,W)
+    strip  = pmid_strip.bool()
+
+    loss = torch.tensor(0.0, device=pred_logit.device)
+
+    if not strip.any():
+        return loss
+
+    # ── Entropy minimisation inside strip ────────────────────
+    p_s   = p_sig[strip].clamp(1e-6, 1 - 1e-6)
+    entropy = -(p_s * p_s.log() + (1 - p_s) * (1 - p_s).log())
+    loss  = loss + entropy.mean()
+
+    # ── Margin: Ω_Δ1 predictions > Ω_Δ2 predictions ─────────
+    # (inner band should be more foreground than outer band)
+    d1_in_strip = strip & omega_d1.bool()
+    d2_in_strip = strip & omega_d2.bool()
+    if d1_in_strip.any() and d2_in_strip.any():
+        p_d1_mean = p_sig[d1_in_strip].mean()
+        p_d2_mean = p_sig[d2_in_strip].mean()
+        margin_loss = F.relu(0.1 - (p_d1_mean - p_d2_mean))
+        loss = loss + margin_loss
+
+    return loss
+
+
+# ─────────────────────────────────────────────────────────────
+# 5-class CCG loss  L_ce5
+# ─────────────────────────────────────────────────────────────
+
+def ccg5_loss(cls_logits, y_c5):
+    """
+    Standard cross-entropy for the 5-class CCG head.
+    cls_logits : (B, 5, H, W)
+    y_c5       : (B, H, W) int64  with values {0,1,2,3,4}
+    """
+    return F.cross_entropy(cls_logits, y_c5)
+
+
+# ─────────────────────────────────────────────────────────────
+# Pixel contrastive loss  L_pcl  (MRPAnno hard-sample selection)
+# ─────────────────────────────────────────────────────────────
+
+def mrpanno_contrastive_loss(embeddings, pred_logit,
+                              y_in, y_out,
+                              omega_d1, omega_d2,
+                              pmid_strip, neg_queue,
+                              temperature=0.5,
+                              max_anchors=512,
+                              pmid_dist_weight=True):
+    """
+    Pixel contrastive learning with MRPAnno hard-sample selection.
+
+    Anchor selection (hard samples)
+    ────────────────────────────────
+    Primary   : pixels in pmid_strip (annotator-identified boundary)
+    Secondary : uncertain pixels (Ω_Δ1 ∪ Ω_Δ2) with high entropy
+
+    Positives : pixels in Ω_I  (certain foreground embeddings)
+    Negatives : pixels in Ω_O  (certain background) + memory queue
+
+    embeddings : (B, D, H, W)  L2-normalised
+    pred_logit : (B,    H, W)  raw logit for entropy computation
+    neg_queue  : (D, Q)        L2-normalised memory queue
+    """
     B, D, H, W = embeddings.shape
     device = embeddings.device
-    seg_pred = (torch.sigmoid(seg_logit.detach()).squeeze(1) >= 0.5).long()
-    y_hat = seg_pred.clone()
-    for b in range(B):
-        valid = (omega_delta[b] == 1) & (pseudo_labels[b] != -1)
-        y_hat[b][valid] = pseudo_labels[b][valid]
+    loss   = torch.tensor(0.0, device=device)
+    count  = 0
 
-    certain_fg = (y_in == 1)
-    certain_bg = (y_en == 0) & (omega_delta == 0)
-    certain_gt = torch.zeros_like(seg_pred)
-    certain_gt[certain_fg] = 1
-    certain_gt[certain_bg] = 0
-    certain_mask = (omega_delta == 0)
-    all_anchor_embs = []
-    all_anchor_lbls = []
-    all_pixel_embs  = []
-    all_pixel_lbls  = []
+    p_sig  = torch.sigmoid(pred_logit).detach()   # (B,H,W)
+    entropy = -(p_sig.clamp(1e-6, 1-1e-6) * p_sig.clamp(1e-6, 1-1e-6).log() +
+                (1-p_sig).clamp(1e-6, 1-1e-6) * (1-p_sig).clamp(1e-6, 1-1e-6).log())
 
     for b in range(B):
-        hard = (
-            (certain_mask[b] & (seg_pred[b] != certain_gt[b])) |
-            ((omega_delta[b] == 1) & (pseudo_labels[b] != -1))
-        )
-        easy = certain_mask[b] & (seg_pred[b] == certain_gt[b])
+        emb_b   = embeddings[b]           # (D, H, W)
+        strip_b = pmid_strip[b].bool()    # (H, W)
+        d1_b    = omega_d1[b].bool()
+        d2_b    = omega_d2[b].bool()
+        in_b    = y_in[b].bool()
+        out_b   = (~y_out[b].bool())
+        ent_b   = entropy[b]              # (H, W)
 
-        h_idx = hard.nonzero(as_tuple=False)
-        e_idx = easy.nonzero(as_tuple=False)
+        # ── Anchor set ────────────────────────────────────────
+        # Primary: P_mid strip pixels (always included)
+        primary_mask = strip_b
 
-        if len(h_idx) == 0 or len(e_idx) == 0:
+        # Secondary: uncertain pixels with entropy > 0.5
+        uncertain_mask = (d1_b | d2_b) & (ent_b > 0.5) & (~strip_b)
+
+        anchor_mask = primary_mask | uncertain_mask
+
+        if not anchor_mask.any():
             continue
 
-        n_h = min(int(num_anchors * hard_ratio), len(h_idx))
-        n_e = min(num_anchors - n_h,             len(e_idx))
+        anchor_idx = anchor_mask.nonzero(as_tuple=False)  # (N,2)
+        if anchor_idx.shape[0] > max_anchors:
+            perm       = torch.randperm(anchor_idx.shape[0], device=device)[:max_anchors]
+            anchor_idx = anchor_idx[perm]
 
-        h_sel = h_idx[torch.randperm(len(h_idx), device=device)[:n_h]]
-        e_sel = e_idx[torch.randperm(len(e_idx), device=device)[:n_e]]
-        anc = torch.cat([h_sel, e_sel], dim=0)
-
-        ah, aw = anc[:, 0], anc[:, 1]
-        all_anchor_embs.append(embeddings[b, :, ah, aw].T)
-        all_anchor_lbls.append(y_hat[b, ah, aw])
-
-        flat_emb = embeddings[b].reshape(D, -1).T
-        flat_lbl = y_hat[b].reshape(-1)
-        pool_n = min(pixel_pool, H * W)
-        pool_idx = torch.randperm(H * W, device=device)[:pool_n]
-        all_pixel_embs.append(flat_emb[pool_idx])
-        all_pixel_lbls.append(flat_lbl[pool_idx])
-
-    if len(all_anchor_embs) == 0:
-        return torch.tensor(0.0, device=device, requires_grad=True)
-
-    anc_emb = torch.cat(all_anchor_embs, dim=0)
-    anc_lbl = torch.cat(all_anchor_lbls, dim=0)
-    pix_emb = torch.cat(all_pixel_embs,  dim=0)
-    pix_lbl = torch.cat(all_pixel_lbls,  dim=0)
-
-    sim_pos_pool = torch.mm(anc_emb, pix_emb.T) / temperature
-    sim_neg_queue = torch.mm(anc_emb, neg_queue)  / temperature
-    neg_denom = torch.exp(sim_neg_queue).sum(dim=1)
-
-    total_loss = torch.tensor(0.0, device=device)
-    valid_count = 0
-
-    for i in range(len(anc_emb)):
-        li = anc_lbl[i].item()
-        if li == -1:
+        # ── Positive set: Ω_I pixels ─────────────────────────
+        pos_idx = in_b.nonzero(as_tuple=False)
+        if pos_idx.shape[0] == 0:
             continue
-        pos_mask = (pix_lbl == li)
-        if pos_mask.sum() == 0:
-            continue
-        pos_sim = torch.exp(sim_pos_pool[i][pos_mask]).mean()
-        denom = pos_sim + neg_denom[i]
-        loss_i = -torch.log(pos_sim / (denom + 1e-6))
-        total_loss = total_loss + loss_i
-        valid_count += 1
+        perm_p  = torch.randperm(pos_idx.shape[0], device=device)[:128]
+        pos_idx = pos_idx[perm_p]
+        pos_emb = emb_b[:, pos_idx[:, 0], pos_idx[:, 1]].T   # (P,D)
+        pos_mean = F.normalize(pos_emb.mean(0, keepdim=True), dim=1)  # (1,D)
 
-    return total_loss / max(valid_count, 1)
+        # ── Negative set: Ω_O + memory queue ─────────────────
+        neg_idx = out_b.nonzero(as_tuple=False)
+        neg_embs_list = []
+        if neg_idx.shape[0] > 0:
+            perm_n  = torch.randperm(neg_idx.shape[0], device=device)[:128]
+            neg_idx = neg_idx[perm_n]
+            neg_embs_list.append(emb_b[:, neg_idx[:, 0], neg_idx[:, 1]].T)  # (N,D)
+        neg_embs_list.append(neg_queue.T)                    # (Q,D)
+        neg_emb = torch.cat(neg_embs_list, dim=0)            # (N+Q, D)
 
+        # ── InfoNCE per anchor ────────────────────────────────
+        anc_emb = emb_b[:, anchor_idx[:, 0], anchor_idx[:, 1]].T  # (A,D)
 
-def dice_coefficient(predicted, labels):
-    if predicted.device != labels.device:
-        labels = labels.to(predicted.device)
-    smooth = 1e-6
-    predicted_flat = predicted.contiguous().view(-1)
-    labels_flat = labels.contiguous().view(-1)
-    intersection = (predicted_flat * labels_flat).sum()
-    total = predicted_flat.sum() + labels_flat.sum()
-    return (2. * intersection + smooth) / (total + smooth)
+        sim_pos = (anc_emb * pos_mean).sum(dim=1, keepdim=True) / temperature  # (A,1)
+        sim_neg = (anc_emb @ neg_emb.T) / temperature                          # (A,N+Q)
 
+        logits  = torch.cat([sim_pos, sim_neg], dim=1)       # (A, 1+N+Q)
+        labels  = torch.zeros(logits.shape[0], dtype=torch.long, device=device)
+        loss    = loss + F.cross_entropy(logits, labels)
+        count  += 1
 
-def iou(predicted, labels):
-    if predicted.device != labels.device:
-        labels = labels.to(predicted.device)
-    smooth = 1e-6
-    predicted_flat = predicted.contiguous().view(-1)
-    labels_flat = labels.contiguous().view(-1)
-    intersection = (predicted_flat * labels_flat).sum()
-    union = predicted_flat.sum() + labels_flat.sum() - intersection
-    return (intersection + smooth) / (union + smooth)
+    return loss / max(count, 1)
 
 
-def test(model, path, dataset, opt):
-    data_path = os.path.join(path, dataset)
-    image_root = f'{data_path}/images/'
-    gt_root = f'{data_path}/masks/'
+# ─────────────────────────────────────────────────────────────
+# Validation loop  (GT used for metrics only — not for loss)
+# ─────────────────────────────────────────────────────────────
+
+def validate(model, val_loader, device, epoch):
     model.eval()
+    dice_sum, iou_sum, n = 0.0, 0.0, 0
+    with torch.no_grad():
+        for pack in val_loader:
+            (images, y_in, y_mid, y_out,
+             omega_d1, omega_d2, softlabel,
+             pmid_strip, y_c5, gt) = pack
 
-    test_loader = get_loader(
-        image_root=image_root,
-        gt_root=gt_root,
-        batchsize=opt.test_batchsize,
+            images = images.to(device)
+            gt     = gt.to(device).squeeze(1).float()
+
+            preds = model(images, mode='test')
+            pred  = torch.sigmoid(preds[-1]).squeeze(1)  # (B,H,W)
+            pred_bin = (pred >= 0.5).float()
+            gt_bin   = (gt   >= 0.5).float()
+
+            for b in range(pred_bin.shape[0]):
+                dice_sum += dice_coefficient(pred_bin[b], gt_bin[b]).item()
+                iou_sum  += iou_score(pred_bin[b], gt_bin[b]).item()
+                n        += 1
+
+    model.train()
+    return dice_sum / max(n, 1), iou_sum / max(n, 1)
+
+
+# ─────────────────────────────────────────────────────────────
+# Training
+# ─────────────────────────────────────────────────────────────
+
+def train(opt):
+    os.makedirs(f'./model_pth/{opt.run_id}', exist_ok=True)
+    os.makedirs('results_polyp', exist_ok=True)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # ── Data ─────────────────────────────────────────────────
+    train_loader = get_loader(
+        image_root=opt.train_path + 'images/',
+        gt_root=opt.train_path + 'masks/',
+        batchsize=opt.batchsize,
+        trainsize=opt.img_size,
+        shuffle=True,
+        num_workers=opt.num_workers,
+        pin_memory=True,
+        augmentation=opt.aug,
+        split='train',
+    )
+    val_loader = get_loader(
+        image_root=opt.val_path + 'images/',
+        gt_root=opt.val_path + 'masks/',
+        batchsize=opt.batchsize,
         trainsize=opt.img_size,
         shuffle=False,
-        augmentation=False
+        num_workers=opt.num_workers,
+        pin_memory=True,
+        augmentation=False,
+        split='val',
     )
 
-    DSC = 0.0
-    IOU = 0.0
-    total_images = 0
+    # ── Model ────────────────────────────────────────────────
+    model = EMCADNet(
+        num_classes=1,
+        kernel_sizes=opt.kernel_sizes,
+        expansion_factor=opt.expansion_factor,
+        dw_parallel=not opt.no_dw_parallel,
+        add=not opt.concatenation,
+        lgag_ks=opt.lgag_ks,
+        activation=opt.activation_mscb,
+        encoder=opt.encoder,
+        pretrain=opt.pretrain,
+        pretrained_dir=opt.pretrained_dir,
+    ).to(device)
 
-    with torch.no_grad():
-        for pack in test_loader:
-            images = pack[0].cuda()
-            gts = pack[5].cuda().float()
+    # ── Optimiser & Scheduler ─────────────────────────────────
+    optimizer = torch.optim.AdamW(model.parameters(),
+                                   lr=opt.lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=opt.epochs, eta_min=1e-6
+    )
 
-            ress = model(images, mode='test')
-            if not isinstance(ress, list):
-                ress = [ress]
-            predictions = ress[-1]
+    # ── Loss weights ─────────────────────────────────────────
+    lam1 = opt.lambda1   # L_pcl
+    lam2 = opt.lambda2   # L_ce5
+    lam3 = opt.lambda3   # L_bound
 
-            for idx in range(len(images)):
-                p = predictions[idx].unsqueeze(0)
-                pred_resized  = torch.sigmoid(p).squeeze()
-                gt_resized = gts[idx].squeeze()
-                input_binary = (pred_resized >= 0.5).float()
-                target_binary = (gt_resized   >= 0.5).float()
-                DSC += dice_coefficient(input_binary, target_binary).item()
-                IOU += iou(input_binary, target_binary).item()
-                total_images += 1
+    best_dice  = 0.0
+    log_rows   = []
 
-    return DSC / total_images, IOU / total_images, total_images
+    for epoch in range(1, opt.epochs + 1):
+        model.train()
 
+        # λ3 warm-up: ramp boundary loss from 0 → lam3 over first 30 epochs
+        lam3_eff = lam3 * min(1.0, epoch / 30.0)
 
+        epoch_loss = 0.0
+        t0 = time.time()
 
-def train(train_loader, model, optimizer, epoch, opt, model_name):
-    model.train()
-    global best, test_dice_at_best_val, total_train_time, dict_plot
+        for step, pack in enumerate(tqdm(train_loader,
+                                         desc=f'Epoch {epoch}/{opt.epochs}',
+                                         leave=False)):
+            (images, y_in, y_mid, y_out,
+             omega_d1, omega_d2, softlabel,
+             pmid_strip, y_c5, gt) = pack
 
-    epoch_start = time.time()
-    loss_record = AvgMeter()
-    size_rates  = [0.75, 1, 1.25]
-    total_step  = len(train_loader)
+            # ── Move to device ────────────────────────────────
+            images     = images.to(device)
+            y_in       = y_in.to(device)
+            y_mid      = y_mid.to(device)
+            y_out      = y_out.to(device)
+            omega_d1   = omega_d1.to(device)
+            omega_d2   = omega_d2.to(device)
+            softlabel  = softlabel.to(device)
+            pmid_strip = pmid_strip.to(device)
+            y_c5       = y_c5.to(device)
+            # gt stays on CPU — never used in loss
 
-    use_ccg_ccl = (epoch > int(0.3 * opt.epoch))
+            # ── Forward pass ──────────────────────────────────
+            preds, cls_logits, embeddings = model(images, mode='train')
+            # preds[-1] = finest prediction (p1), shape (B,1,H,W)
+            pred_logit = preds[-1].squeeze(1)   # (B,H,W)
 
-    for i, (images, y_in, y_en, omega_delta, y_c, gts) in enumerate(
-            train_loader, start=1):
-
-        for rate in size_rates:
-            optimizer.zero_grad()
-
-           # move to gpu
-            images = Variable(images).cuda()
-            y_in = y_in.float().cuda()
-            y_en = y_en.float().cuda()
-            omega_delta = omega_delta.float().cuda()
-            y_c = y_c.long().cuda()
-            gts = Variable(gts).float().cuda()
-
-            # Multi-scale resize 
-            if rate != 1:
-                trainsize = int(round(opt.img_size * rate / 32) * 32)
-                images = F.interpolate(
-                    images,
-                    size=(trainsize, trainsize),
-                    mode='bilinear',
-                    align_corners=True
-                )
-
-            # Forward pass 
-            P, cls_logits, embeddings = model(images, mode='train')
-
-            if not isinstance(P, list):
-                P = [P]
-
-            # Resize helper
-            def resize_mask(m, size):
-                return F.interpolate(
-                    m.unsqueeze(1).float(), size=size, mode='nearest'
-                ).squeeze(1)
-
-            target_size = P[0].shape[2:]
-            y_in_r = resize_mask(y_in, target_size)
-            y_en_r = resize_mask(y_en, target_size)
-
-            # Lc: dual-mask Dice on 4 heads + ensemble
-            seg_ensemble = P[0] + P[1] + P[2] + P[3]
-            loss = (
-                dual_mask_loss(P[0],y_in_r, y_en_r) +
-                dual_mask_loss(P[1],y_in_r, y_en_r) +
-                dual_mask_loss(P[2],y_in_r, y_en_r) +
-                dual_mask_loss(P[3],y_in_r, y_en_r) +
-                dual_mask_loss(seg_ensemble, y_in_r, y_en_r)
+            # ── L_seg: multi-zone weighted Dice+BCE ───────────
+            loss_seg = mrpanno_seg_loss(
+                pred_logit, y_in, y_out,
+                omega_d1, omega_d2, softlabel,
+                alpha=ALPHA, beta=BETA
             )
 
-            # CCG + CCL (after warmup)
-            # Snapshot embeddings NOW (before backward) so queue update
-            # can happen safely AFTER backward without holding the graph.
-            emb_snapshot = None
-
-            if use_ccg_ccl:
-                H_img = images.shape[2]
-                W_img = images.shape[3]
-                y_in_full = resize_mask(y_in,(H_img, W_img))
-                y_en_full = resize_mask(y_en,(H_img, W_img))
-                od_full   = resize_mask(omega_delta,(H_img, W_img))
-                y_c_full  = F.interpolate(
-                    y_c.unsqueeze(1).float(),
-                    size=(H_img, W_img),
-                    mode='nearest'
-                ).squeeze(1).long()
-
-                Lce = classification_loss_ccg(cls_logits, y_c_full)
-                pseudo = generate_pseudo_labels(
-                    P[-1].detach(), cls_logits.detach(), od_full
+            # Auxiliary heads (same zone loss, lower weight)
+            for aux_pred in preds[:-1]:
+                aux_logit = aux_pred.squeeze(1)
+                loss_seg  = loss_seg + 0.4 * mrpanno_seg_loss(
+                    aux_logit, y_in, y_out,
+                    omega_d1, omega_d2, softlabel
                 )
 
-                # pass detached clone of queue
-                LPCL = contrastive_loss_ccl(
-                    embeddings,
-                    P[-1].detach(),
-                    pseudo,
-                    od_full,
-                    y_in_full,
-                    y_en_full,
-                    model.neg_queue.detach().clone(),  # detached clone
-                    temperature=0.1,
-                    hard_ratio=0.7,
-                    num_anchors=100,
-                    pixel_pool=512
-                )
+            # ── L_ce5: 5-class CCG classification ─────────────
+            loss_ce5 = ccg5_loss(cls_logits, y_c5)
 
-                loss = loss + opt.lambda1 * LPCL + opt.lambda2 * Lce
+            # ── L_bound: boundary consistency ─────────────────
+            loss_bound = boundary_consistency_loss(
+                pred_logit, pmid_strip, omega_d1, omega_d2
+            )
 
-                # snapshot BEFORE backward
-                emb_snapshot = embeddings.detach().permute(
-                    0, 2, 3, 1
-                ).reshape(-1, model.embed_dim)
+            # ── L_pcl: contrastive (with MRPAnno hard sampling) 
+            loss_pcl = mrpanno_contrastive_loss(
+                embeddings, pred_logit,
+                y_in, y_out,
+                omega_d1, omega_d2,
+                pmid_strip,
+                model.neg_queue,
+                temperature=opt.temperature,
+                max_anchors=opt.max_anchors,
+            )
+
+            # ── Update neg queue with current Ω_O embeddings ──
+            with torch.no_grad():
+                bg_mask = (~y_out.bool())   # (B,H,W)
+                for b in range(images.shape[0]):
+                    idx = bg_mask[b].nonzero(as_tuple=False)
+                    if idx.shape[0] > 0:
+                        perm = torch.randperm(idx.shape[0])[:32]
+                        vecs = embeddings[b, :,
+                                          idx[perm, 0],
+                                          idx[perm, 1]].T     # (32,D)
+                        model.update_queue(vecs)
+
+            # ── Total loss ────────────────────────────────────
+            loss = loss_seg + lam1 * loss_pcl + lam2 * loss_ce5 + lam3_eff * loss_bound
+
+            optimizer.zero_grad()
             loss.backward()
-
-            # update queue AFTER backward
-            if emb_snapshot is not None:
-                with torch.no_grad():
-                    idx = torch.randperm(
-                        emb_snapshot.shape[0],
-                        device=emb_snapshot.device
-                    )[:64]
-                    model.update_queue(emb_snapshot[idx])
-
-
-            clip_gradient(optimizer, opt.clip)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-            if rate == 1:
-                loss_record.update(loss.data, opt.batchsize)
+            epoch_loss += loss.item()
 
-        if i % 100 == 0 or i == total_step:
-            phase = "CCG+CCL" if use_ccg_ccl else "warmup-Lc"
-            print(f'{datetime.now()} Epoch [{epoch:03d}/{opt.epoch:03d}], '
-                  f'Step [{i:04d}/{total_step:04d}], '
-                  f'LR: {optimizer.param_groups[0]["lr"]:.6f}, '
-                  f'Loss: {loss_record.show():.4f}  [{phase}]')
+        scheduler.step()
+        avg_loss = epoch_loss / len(train_loader)
 
-    total_train_time += (time.time() - epoch_start)
+        # ── Validation ───────────────────────────────────────
+        val_dice, val_iou = validate(model, val_loader, device, epoch)
+        elapsed = time.time() - t0
 
-    save_path = opt.train_save
-    os.makedirs(save_path, exist_ok=True)
-    torch.save(model.state_dict(),
-               os.path.join(save_path, f"{model_name}-last.pth"))
+        print(f'Epoch {epoch:03d} | loss {avg_loss:.4f} | '
+              f'val_dice {val_dice:.4f} | val_iou {val_iou:.4f} | '
+              f'{elapsed:.1f}s | λ3_eff={lam3_eff:.3f}')
 
-    epoch_results = {}
-    for ds in ['test', 'val']:
-        d_dice, d_iou, _ = test(model, opt.test_path, ds, opt)
-        epoch_results[ds] = d_dice
-        logging.info(f'Epoch: {epoch}, Dataset: {ds}, '
-                     f'Dice: {d_dice:.4f}, IoU: {d_iou:.4f}')
-        print(f'Epoch: {epoch}, Dataset: {ds}, '
-              f'Dice: {d_dice:.4f}, IoU: {d_iou:.4f}')
-        dict_plot[ds].append(d_dice)
+        log_rows.append({
+            'epoch': epoch, 'loss': avg_loss,
+            'val_dice': val_dice, 'val_iou': val_iou
+        })
 
-    if epoch_results['val'] > best:
-        logging.info(
-            f"### Best Model Saved "
-            f"(Dice {best:.4f} -> {epoch_results['val']:.4f}) ###"
-        )
-        print(
-            f"### Best Model Saved "
-            f"(Dice {best:.4f} -> {epoch_results['val']:.4f}) ###"
-        )
-        best                  = epoch_results['val']
-        test_dice_at_best_val = epoch_results['test']
+        # ── Save best model ───────────────────────────────────
+        if val_dice > best_dice:
+            best_dice = val_dice
+            torch.save(model.state_dict(),
+                       f'./model_pth/{opt.run_id}/{opt.run_id}-best.pth')
+            print(f'  ✓ New best saved  (dice={best_dice:.4f})')
+
+        # ── Save latest checkpoint ────────────────────────────
         torch.save(model.state_dict(),
-                   os.path.join(save_path, f"{model_name}-best.pth"))
+                   f'./model_pth/{opt.run_id}/{opt.run_id}-latest.pth')
+
+    # ── Training log ─────────────────────────────────────────
+    pd.DataFrame(log_rows).to_excel(
+        f'results_polyp/TrainLog_{opt.run_id}.xlsx', index=False
+    )
+    print(f'\nTraining complete. Best val Dice = {best_dice:.4f}')
 
 
-
+# ─────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    dataset_name = 'ClinicDB'
-
     parser = argparse.ArgumentParser()
-    parser.add_argument('--encoder', type=str, default='pvt_v2_b2')
-    parser.add_argument('--expansion_factor', type=int, default=2)
-    parser.add_argument('--kernel_sizes', type=int, nargs='+',
-                        default=[1, 3, 5])
-    parser.add_argument('--lgag_ks', type=int, default=3)
-    parser.add_argument('--activation_mscb', type=str, default='relu6')
-    parser.add_argument('--no_dw_parallel', action='store_true',
-                        default=False)
-    parser.add_argument('--concatenation', action='store_true',
-                        default=False)
-    parser.add_argument('--no_pretrain', action='store_true', default=False)
-    parser.add_argument('--pretrained_dir', type=str,
-                        default='./pretrained_pth/pvt/')
-    parser.add_argument('--supervision', type=str, default='mutation')
-    parser.add_argument('--epoch', type=int, default=200)
-    parser.add_argument('--lr', type=float, default=0.0005)
-    parser.add_argument('--alpha', type=float, default=0.3)
-    parser.add_argument('--lambda1', type=float, default=0.3, ##according to the paper EAUWSeg, 0.3 is the best value for lambda1
-                        help='weight for contrastive loss LPCL')
-    parser.add_argument('--lambda2', type=float, default=0.5,###according to the paper EAUWSeg, 0.5 is the best value for lambda2
-                        help='weight for classification loss Lce')
-    parser.add_argument('--batchsize', type=int, default=8)
-    parser.add_argument('--test_batchsize', type=int, default=8)
-    parser.add_argument('--img_size', type=int, default=352)
-    parser.add_argument('--clip', type=float, default=0.5)
-    parser.add_argument('--decay_rate', type=float, default=0.1)
-    parser.add_argument('--decay_epoch', type=int, default=300)
-    parser.add_argument('--color_image', default=True)
-    parser.add_argument('--augmentation', default=True)
-    parser.add_argument('--train_path', type=str,
-                        default=f'./data/polyp/target/{dataset_name}/train/')
-    parser.add_argument('--test_path', type=str,
-                        default=f'./data/polyp/target/{dataset_name}/')
-    parser.add_argument('--train_save', type=str, default='')
-    parser.add_argument('--resume', type=str, default='',
-                        help='path to .pth checkpoint to resume from')
-
+    parser.add_argument('--run_id',           type=str,   required=True)
+    parser.add_argument('--encoder',          type=str,   default='pvt_v2_b2')
+    parser.add_argument('--expansion_factor', type=int,   default=2)
+    parser.add_argument('--kernel_sizes',     type=int,   nargs='+', default=[1, 3, 5])
+    parser.add_argument('--lgag_ks',          type=int,   default=3)
+    parser.add_argument('--activation_mscb',  type=str,   default='relu6')
+    parser.add_argument('--no_dw_parallel',   action='store_true', default=False)
+    parser.add_argument('--concatenation',    action='store_true', default=False)
+    parser.add_argument('--img_size',         type=int,   default=352)
+    parser.add_argument('--batchsize',        type=int,   default=8)
+    parser.add_argument('--epochs',           type=int,   default=100)
+    parser.add_argument('--lr',               type=float, default=1e-4)
+    parser.add_argument('--num_workers',      type=int,   default=4)
+    parser.add_argument('--aug',              type=bool,  default=True)
+    parser.add_argument('--pretrain',         type=bool,  default=True)
+    parser.add_argument('--pretrained_dir',   type=str,   default='./pretrained_pth/pvt/')
+    parser.add_argument('--train_path',       type=str,   default='./data/polyp/TrainDataset/')
+    parser.add_argument('--val_path',         type=str,   default='./data/polyp/ValDataset/')
+    # Loss weights
+    parser.add_argument('--lambda1',          type=float, default=0.4,  help='L_pcl weight')
+    parser.add_argument('--lambda2',          type=float, default=1.0,  help='L_ce5 weight')
+    parser.add_argument('--lambda3',          type=float, default=0.3,  help='L_bound weight')
+    # Contrastive
+    parser.add_argument('--temperature',      type=float, default=0.5)
+    parser.add_argument('--max_anchors',      type=int,   default=512)
     opt = parser.parse_args()
 
-    for run in [1, 2, 3, 4, 5]:
-        dict_plot             = {'val': [], 'test': []}
-        best                  = 0.0
-        test_dice_at_best_val = 0.0
-        total_train_time      = 0
-
-        aggregation = 'concat' if opt.concatenation  else 'add'
-        dw_mode     = 'series' if opt.no_dw_parallel else 'parallel'
-
-        timestamp = time.strftime('%H%M%S')
-        run_id = (
-            f"{dataset_name}_{opt.encoder}_EMCAD"
-            f"_kernel_sizes_{opt.kernel_sizes}"
-            f"_dw_{dw_mode}_{aggregation}"
-            f"_lgag_ks_{opt.lgag_ks}"
-            f"_ef{opt.expansion_factor}"
-            f"_act_mscb_{opt.activation_mscb}"
-            f"_bs{opt.batchsize}"
-            f"_lr{opt.lr}"
-            f"_e{opt.epoch}"
-            f"_aug{opt.augmentation}"
-            f"_run{run}_t{timestamp}"
-        )
-        run_id = run_id.replace('[', '').replace(']', '').replace(', ', '_')
-        opt.train_save = f'./model_pth/{run_id}/'
-
-        os.makedirs('logs', exist_ok=True)
-        os.makedirs(opt.train_save, exist_ok=True)
-
-        logging.basicConfig(
-            filename=f'logs/train_log_{run_id}.log',
-            level=logging.INFO,
-            format='[%(asctime)s] %(message)s',
-            force=True
-        )
-
-        model = EMCADNet(
-            num_classes = 1,
-            kernel_sizes = opt.kernel_sizes,
-            expansion_factor = opt.expansion_factor,
-            dw_parallel = not opt.no_dw_parallel,
-            add = not opt.concatenation,
-            lgag_ks = opt.lgag_ks,
-            activation = opt.activation_mscb,
-            encoder = opt.encoder,
-            pretrain = not opt.no_pretrain,
-            pretrained_dir = opt.pretrained_dir
-        )
-
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model.to(device)
-
-        # Resume from checkpoint if specified
-        if opt.resume and os.path.isfile(opt.resume):
-            print(f"Resuming from: {opt.resume}")
-            ckpt = torch.load(opt.resume, map_location=device)
-            if isinstance(ckpt, dict) and 'model' in ckpt:
-                model.load_state_dict(ckpt['model'])
-            else:
-                model.load_state_dict(ckpt)
-            print("Checkpoint loaded")
-        elif opt.resume:
-            print(f"WARNING: checkpoint not found at {opt.resume}")
-
-        print(f"Encoder: {opt.encoder} | Decoder: EMCAD")
-        cal_params_flops(model, opt.img_size, logging)
-
-        optimizer = torch.optim.AdamW(
-            model.parameters(), opt.lr, weight_decay=1e-4
-        )
-        scheduler = CosineAnnealingLR(
-            optimizer, T_max=opt.epoch, eta_min=1e-6
-        )
-
-        train_loader = get_loader(
-            image_root = f'{opt.train_path}/images/',
-            gt_root = f'{opt.train_path}/masks/',
-            batchsize = opt.batchsize,
-            trainsize = opt.img_size,
-            shuffle = True,
-            augmentation = opt.augmentation,
-            split = 'train',
-            color_image = opt.color_image
-        )
-
-        for epoch in range(1, opt.epoch + 1):
-            adjust_lr(optimizer, opt.lr, epoch,
-                      opt.decay_rate, opt.decay_epoch)
-            train(train_loader, model, optimizer, epoch, opt, run_id)
-            scheduler.step()
-
-        summary = (
-            f"\n{'='*40}\n"
-            f"FINAL RESULTS: {run_id}\n"
-            f"Best Val Dice:          {best:.4f}\n"
-            f"Test Dice at Best Val:  {test_dice_at_best_val:.4f}\n"
-            f"Total Train Time:       {total_train_time:.2f}s\n"
-            f"{'='*40}"
-        )
-        print(summary)
-        logging.info(summary)
+    train(opt)
