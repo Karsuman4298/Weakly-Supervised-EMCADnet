@@ -25,7 +25,7 @@ import argparse
 from tqdm import tqdm
 
 from lib.networks import EMCADNet
-from utils.dataloader_polyp import get_loader, ALPHA, BETA
+from utils.dataloader import get_loader, ALPHA, BETA
 from medpy.metric.binary import hd95
 
 
