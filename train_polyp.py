@@ -11,10 +11,11 @@ import argparse
 from tqdm import tqdm
 
 from lib.networks import EMCADNet
-from utils.dataloader_polyp import get_loader, ALPHA, BETA
+from utils.dataloader_polyp import get_loader
 from medpy.metric.binary import hd95
 
-
+ALPHA = 0.70   # Ω_Δ1 (inner band, likely FG) pseudo-label
+BETA  = 0.30   
 # ─────────────────────────────────────────────────────────────
 # Metric helpers — identical to original
 # ─────────────────────────────────────────────────────────────
