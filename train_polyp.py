@@ -11,7 +11,7 @@ import argparse
 from tqdm import tqdm
 
 from lib.networks import EMCADNet
-from utils.dataloader_polyp import get_loader
+from utils.dataloader import get_loader
 from medpy.metric.binary import hd95
 
 ALPHA = 0.70   # Ω_Δ1 (inner band, likely FG) pseudo-label
