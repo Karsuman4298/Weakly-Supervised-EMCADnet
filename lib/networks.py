@@ -1,5 +1,5 @@
-# network.py  — MRPAnno version
-# Key change: cls_head output expanded from 3 → 5 classes (CCG-5)
+# network.py — MRPAnno version
+# CCG head reverted from 5-class to 3-class
 
 import torch
 import torch.nn as nn
@@ -24,14 +24,13 @@ class EMCADNet(nn.Module):
                  pretrained_dir='./pretrained_pth/pvt/'):
         super(EMCADNet, self).__init__()
 
-        # Grayscale → 3-channel converter
         self.conv = nn.Sequential(
             nn.Conv2d(1, 3, kernel_size=1),
             nn.BatchNorm2d(3),
             nn.ReLU(inplace=True)
         )
 
-        # ── Backbone ─────────────────────────────────────────
+        # ── Backbone ──────────────────────────────────────────
         if encoder == 'pvt_v2_b0':
             self.backbone = pvt_v2_b0()
             path = pretrained_dir + '/pvt_v2_b0.pth'
@@ -78,9 +77,10 @@ class EMCADNet(nn.Module):
             channels = [512, 320, 128, 64]
 
         if pretrain and 'pvt_v2' in encoder:
-            save_model  = torch.load(path)
-            model_dict  = self.backbone.state_dict()
-            state_dict  = {k: v for k, v in save_model.items() if k in model_dict}
+            save_model = torch.load(path)
+            model_dict = self.backbone.state_dict()
+            state_dict = {k: v for k, v in save_model.items()
+                          if k in model_dict}
             model_dict.update(state_dict)
             self.backbone.load_state_dict(model_dict)
 
@@ -88,7 +88,7 @@ class EMCADNet(nn.Module):
               (encoder + ' backbone: ',
                sum(m.numel() for m in self.backbone.parameters())))
 
-        # ── Decoder ──────────────────────────────────────────
+        # ── Decoder ───────────────────────────────────────────
         self.decoder = EMCAD(
             channels=channels,
             kernel_sizes=kernel_sizes,
@@ -102,20 +102,23 @@ class EMCADNet(nn.Module):
               ('EMCAD decoder: ',
                sum(m.numel() for m in self.decoder.parameters())))
 
-        # ── Segmentation output heads ─────────────────────────
+        # ── Segmentation heads ────────────────────────────────
         self.out_head4 = nn.Conv2d(channels[0], num_classes, 1)
         self.out_head3 = nn.Conv2d(channels[1], num_classes, 1)
         self.out_head2 = nn.Conv2d(channels[2], num_classes, 1)
         self.out_head1 = nn.Conv2d(channels[3], num_classes, 1)
 
-        # ── CCG-5: 5-class classification head ───────────────
-        # Classes: 0=Ω_O, 1=Ω_Δ2, 2=P_mid strip, 3=Ω_Δ1, 4=Ω_I
+        # ── CCG-3: 3-class classification head ───────────────
+        # Class 0: Ω_O (certain BG)
+        # Class 1: Ω_Δ (uncertain — both bands combined)
+        # Class 2: Ω_I (certain FG)
+        # Reverted from CCG-5 to CCG-3 to free decoder capacity
         self.cls_head = nn.Sequential(
             nn.Conv2d(channels[3], channels[3] // 2,
                       kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(channels[3] // 2),
             nn.ReLU(inplace=True),
-            nn.Conv2d(channels[3] // 2, 5, kernel_size=1)   # ← 3→5
+            nn.Conv2d(channels[3] // 2, 3, kernel_size=1)  # 5 → 3
         )
 
         # ── CCL embedding head ────────────────────────────────
@@ -135,36 +138,33 @@ class EMCADNet(nn.Module):
         )
         self.register_buffer('queue_ptr', torch.zeros(1, dtype=torch.long))
 
-    # ─────────────────────────────────────────────────────────
     def forward(self, x, mode='test'):
         if x.size(1) == 1:
             x = self.conv(x)
 
-        # Encoder
         x1, x2, x3, x4 = self.backbone(x)
-
-        # Decoder
         dec_outs = self.decoder(x4, [x3, x2, x1])
-        # dec_outs = [d4, d3, d2, d1]
 
-        # Segmentation predictions
         p4 = F.interpolate(self.out_head4(dec_outs[0]),
-                           scale_factor=32, mode='bilinear', align_corners=False)
+                           scale_factor=32, mode='bilinear',
+                           align_corners=False)
         p3 = F.interpolate(self.out_head3(dec_outs[1]),
-                           scale_factor=16, mode='bilinear', align_corners=False)
+                           scale_factor=16, mode='bilinear',
+                           align_corners=False)
         p2 = F.interpolate(self.out_head2(dec_outs[2]),
-                           scale_factor=8,  mode='bilinear', align_corners=False)
+                           scale_factor=8,  mode='bilinear',
+                           align_corners=False)
         p1 = F.interpolate(self.out_head1(dec_outs[3]),
-                           scale_factor=4,  mode='bilinear', align_corners=False)
+                           scale_factor=4,  mode='bilinear',
+                           align_corners=False)
 
         if mode == 'test':
             return [p4, p3, p2, p1]
 
-        # Training-only heads
         H, W = x.shape[2], x.shape[3]
-        d1   = dec_outs[3]                             # finest feature map
+        d1   = dec_outs[3]
 
-        # CCG-5 classification (5 zones)
+        # CCG-3 classification
         cls_logits = self.cls_head(d1)
         cls_logits = F.interpolate(cls_logits, size=(H, W),
                                    mode='bilinear', align_corners=False)
@@ -177,10 +177,8 @@ class EMCADNet(nn.Module):
 
         return [p4, p3, p2, p1], cls_logits, embeddings
 
-    # ─────────────────────────────────────────────────────────
     @torch.no_grad()
     def update_queue(self, new_vecs):
-        """Push new_vecs (N, D) into FIFO memory queue."""
         n   = new_vecs.shape[0]
         ptr = int(self.queue_ptr)
         end = ptr + n
@@ -188,7 +186,7 @@ class EMCADNet(nn.Module):
             self.neg_queue[:, ptr:end] = new_vecs.T
         else:
             first = self.queue_size - ptr
-            self.neg_queue[:, ptr:]    = new_vecs[:first].T
+            self.neg_queue[:, ptr:]       = new_vecs[:first].T
             self.neg_queue[:, :n - first] = new_vecs[first:].T
         self.queue_ptr[0] = end % self.queue_size
 
@@ -197,6 +195,6 @@ if __name__ == '__main__':
     model = EMCADNet().cuda()
     x = torch.randn(1, 3, 352, 352).cuda()
     preds, cls, emb = model(x, mode='train')
-    print([p.shape for p in preds])   # 4 × (1,1,352,352)
-    print(cls.shape)                   # (1,5,352,352)
-    print(emb.shape)                   # (1,128,352,352)
+    print([p.shape for p in preds])
+    print(cls.shape)   # (1, 3, 352, 352)
+    print(emb.shape)   # (1, 128, 352, 352)

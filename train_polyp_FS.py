@@ -186,7 +186,6 @@ if __name__ == '__main__':
     parser.add_argument('--train_save', type=str, default='./model_pth_full/')
 
     opt = parser.parse_args()
-
     best = 0.0
     test_dice_at_best_val = 0.0
     total_train_time = 0

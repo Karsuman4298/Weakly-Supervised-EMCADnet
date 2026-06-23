@@ -1,4 +1,4 @@
-# dataloader.py  — MRPAnno version
+# dataloader.py — MRPAnno version with PRC support
 # Ground truth is NEVER used for training supervision.
 # GT is returned only for validation/test metric computation.
 
@@ -16,27 +16,18 @@ from scipy.ndimage import distance_transform_edt
 # ─────────────────────────────────────────────────────────────
 # MRPAnno Configuration
 # ─────────────────────────────────────────────────────────────
-# P_out  : GT dilated  → loose envelope  (same as BPAnno outer)
-# P_mid  : GT itself   → boundary approximation (NEW)
-# P_in   : GT eroded   → conservative interior  (same as BPAnno inner)
-#
-# Dilation scale kept same as BPAnno for P_out.
-# Erosion scale increased slightly vs BPAnno so that P_in sits
-# clearly inside P_mid, giving a non-degenerate Ω_Δ1 band.
-# ─────────────────────────────────────────────────────────────
-MRPANNO_DIL_SCALE    = 0.40    # P_out dilation   (same as BPAnno)
-MRPANNO_ERO_SCALE    = 0.30    # P_in  erosion    (larger than BPAnno 0.22)
-MRPANNO_MID_SCALE    = 0.08    # P_mid tiny smoothing dilation before contour
-MRPANNO_DP_RATIO     = 0.02    # Douglas-Peucker: 2 % of perimeter
+MRPANNO_DIL_SCALE    = 0.40
+MRPANNO_ERO_SCALE    = 0.30
+MRPANNO_MID_SCALE    = 0.08
+MRPANNO_DP_RATIO     = 0.02
 MRPANNO_MIN_VERTICES = 5
 MRPANNO_MAX_VERTICES = 15
 
-# Soft-label weights for the two uncertain bands
-ALPHA = 0.70   # Ω_Δ1 (inner band, likely FG) pseudo-label
-BETA  = 0.30   # Ω_Δ2 (outer band, likely BG) pseudo-label
-
-# Bandwidth for distance-sigmoid soft label (pixels)
-SIGMA_SOFT = 8.0
+# Fixed pseudo-label values (replaces distance-sigmoid)
+ALPHA    = 0.40    # Ω_Δ1 zone weight in loss
+BETA     = 0.15    # Ω_Δ2 zone weight in loss
+TGT_D1   = 0.85   # Ω_Δ1 fixed pseudo-label target
+TGT_D2   = 0.15   # Ω_Δ2 fixed pseudo-label target
 
 
 # ─────────────────────────────────────────────────────────────
@@ -44,7 +35,6 @@ SIGMA_SOFT = 8.0
 # ─────────────────────────────────────────────────────────────
 
 def _morph(binary_u8, ksize, op):
-    """Apply morphological operation with elliptic kernel."""
     if ksize < 1:
         ksize = 1
     if ksize % 2 == 0:
@@ -59,10 +49,6 @@ def _to_poly_mask(binary_u8, H, W,
                   dp_ratio=MRPANNO_DP_RATIO,
                   min_v=MRPANNO_MIN_VERTICES,
                   max_v=MRPANNO_MAX_VERTICES):
-    """
-    Largest-contour → Douglas-Peucker polygon (5-15 vertices) → filled mask.
-    Returns uint8 mask (H, W).
-    """
     contours, _ = cv2.findContours(
         binary_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
     )
@@ -78,14 +64,12 @@ def _to_poly_mask(binary_u8, H, W,
     epsilon = perimeter * dp_ratio
     polygon = cv2.approxPolyDP(contour, epsilon, closed=True)
 
-    # Too many vertices → increase epsilon
     for _ in range(15):
         if len(polygon) <= max_v:
             break
         epsilon *= 1.25
         polygon = cv2.approxPolyDP(contour, epsilon, closed=True)
 
-    # Too few vertices → decrease epsilon
     for _ in range(15):
         if len(polygon) >= min_v:
             break
@@ -100,65 +84,62 @@ def _to_poly_mask(binary_u8, H, W,
 def generate_mrpanno(gt_np, dp_epsilon_ratio=MRPANNO_DP_RATIO):
     """
     Generate MRPAnno polygon masks from binary GT mask.
-    GT is used ONLY to derive the three polygon shapes here —
-    it is never passed to the training loss directly.
 
-    Zone definitions
-    ────────────────
-    Ω_I   : inside P_in           → certain foreground
-    Ω_Δ1  : P_in  → P_mid        → inner uncertain (likely FG, weight α)
-    Ω_Δ2  : P_mid → P_out        → outer uncertain (likely BG, weight β)
-    Ω_O   : outside P_out         → certain background
+    Changes vs previous version:
+    - softlabel removed (no longer needed — PRC handles targets in train loop)
+    - y_c5 replaced by y_c3 (3-class CCG: BG=0 / uncertain=1 / FG=2)
+    - pmid_strip kept for contrastive anchor selection
 
     Returns
     ───────
     y_in        (H,W) float32   P_in fill   — certain FG mask
-    y_mid       (H,W) float32   P_mid fill  — boundary polygon fill (NEW)
+    y_mid       (H,W) float32   P_mid fill  — boundary polygon fill
     y_out       (H,W) float32   P_out fill  — envelope mask
     omega_d1    (H,W) float32   Ω_Δ1 mask  (inner uncertain band)
     omega_d2    (H,W) float32   Ω_Δ2 mask  (outer uncertain band)
-    softlabel   (H,W) float32   distance-sigmoid soft label ∈ [0,1]
     pmid_strip  (H,W) float32   thin strip ±3px around P_mid boundary
-    y_c5        (H,W) int64     5-class CCG label map
+    y_c3        (H,W) int64     3-class CCG label map
                                   0 = Ω_O   (certain BG)
-                                  1 = Ω_Δ2  (outer uncertain)
-                                  2 = P_mid strip (boundary zone)
-                                  3 = Ω_Δ1  (inner uncertain)
-                                  4 = Ω_I   (certain FG)
+                                  1 = Ω_Δ   (uncertain — both bands)
+                                  2 = Ω_I   (certain FG)
     """
     gt_u8 = (gt_np * 255).astype(np.uint8)
     H, W  = gt_np.shape
 
-    # ── Adaptive kernel sizes from lesion radius ──────────────
+    # ── Adaptive kernel sizes ─────────────────────────────────
     area   = float((gt_u8 > 127).sum())
     radius = np.sqrt(max(area, 1.0) / np.pi)
 
-    dil_ks = max(7,  int(radius * MRPANNO_DIL_SCALE))
-    ero_ks = max(5,  int(radius * MRPANNO_ERO_SCALE))
-    mid_ks = max(3,  int(radius * MRPANNO_MID_SCALE))  # tiny smooth for P_mid
+    dil_ks = max(7, int(radius * MRPANNO_DIL_SCALE))
+    ero_ks = max(5, int(radius * MRPANNO_ERO_SCALE))
+    mid_ks = max(3, int(radius * MRPANNO_MID_SCALE))
 
-    # force odd
     dil_ks = dil_ks + (dil_ks % 2 == 0)
     ero_ks = ero_ks + (ero_ks % 2 == 0)
     mid_ks = mid_ks + (mid_ks % 2 == 0)
 
+    # ── Small lesion fallback check ───────────────────────────
+    lesion_diameter = 2.0 * radius
+
     # ── Three morphological bases ─────────────────────────────
-    dilated = _morph(gt_u8, dil_ks, 'dilate')   # P_out base
-    eroded  = _morph(gt_u8, ero_ks, 'erode')    # P_in  base
-    midbase = _morph(gt_u8, mid_ks, 'dilate')   # P_mid base (tiny smooth)
+    dilated = _morph(gt_u8, dil_ks, 'dilate')
+    eroded  = _morph(gt_u8, ero_ks, 'erode')
+    midbase = _morph(gt_u8, mid_ks, 'dilate')
 
     # ── Polygon fills ─────────────────────────────────────────
     p_out_u8 = _to_poly_mask(dilated, H, W, dp_epsilon_ratio)
     p_in_u8  = _to_poly_mask(eroded,  H, W, dp_epsilon_ratio)
     p_mid_u8 = _to_poly_mask(midbase, H, W, dp_epsilon_ratio)
 
-    # Fallback: erosion collapsed → use GT as P_in
+    # Fallback: erosion collapsed
     if p_in_u8.sum() == 0:
-        p_in_u8 = gt_u8.copy()
+        if gt_u8.sum() > 0:
+            p_in_u8 = gt_u8.copy()
 
     # Containment enforcement
-    # P_in must be inside P_mid must be inside P_out
-    p_in_u8  = np.where((p_out_u8 > 0) & (p_mid_u8 > 0), p_in_u8, 0).astype(np.uint8)
+    p_in_u8  = np.where(
+        (p_out_u8 > 0) & (p_mid_u8 > 0), p_in_u8, 0
+    ).astype(np.uint8)
     p_mid_u8 = np.where(p_out_u8 > 0, p_mid_u8, 0).astype(np.uint8)
 
     # Float masks
@@ -167,43 +148,42 @@ def generate_mrpanno(gt_np, dp_epsilon_ratio=MRPANNO_DP_RATIO):
     y_in  = (p_in_u8  > 127).astype(np.float32)
 
     # ── Zone masks ────────────────────────────────────────────
-    # Ω_I   = inside P_in
     omega_I  = y_in.astype(bool)
-    # Ω_Δ1  = inside P_mid but outside P_in
-    omega_d1 = (y_mid.astype(bool)) & (~omega_I)
-    # Ω_Δ2  = inside P_out but outside P_mid
-    omega_d2 = (y_out.astype(bool)) & (~y_mid.astype(bool))
-    # Ω_O   = outside P_out  (complement of y_out)
+    omega_d1 = y_mid.astype(bool) & ~omega_I
+    omega_d2 = y_out.astype(bool) & ~y_mid.astype(bool)
 
-    # ── P_mid boundary strip (±3 px) ─────────────────────────
-    p_mid_bool = y_mid.astype(np.uint8)
-    strip_dil  = _morph(p_mid_bool, 7, 'dilate')   # 3px outward
-    strip_ero  = _morph(p_mid_bool, 7, 'erode')    # 3px inward
-    pmid_strip = ((strip_dil > 0) & (strip_ero == 0)).astype(np.float32)
+    # ── P_mid boundary strip (±3px) ───────────────────────────
+    p_mid_u8_bool = y_mid.astype(np.uint8)
+    strip_dil     = _morph(p_mid_u8_bool, 7, 'dilate')
+    strip_ero     = _morph(p_mid_u8_bool, 7, 'erode')
+    pmid_strip    = ((strip_dil > 0) & (strip_ero == 0)).astype(np.float32)
 
-    # ── Distance-sigmoid soft label ───────────────────────────
-    # Signed distance from P_mid polygon boundary
-    dist_in  =  distance_transform_edt(y_mid).astype(np.float32)
-    dist_out = -distance_transform_edt(1.0 - y_mid).astype(np.float32)
-    signed   = np.where(y_mid > 0.5, dist_in, dist_out)
-    softlabel = (1.0 / (1.0 + np.exp(-signed / SIGMA_SOFT))).astype(np.float32)
+    # ── Small lesion fallback ─────────────────────────────────
+    if lesion_diameter < 12.0:
+        # Collapse to BPAnno: merge bands, wipe strip
+        omega_d2   = (omega_d1 | omega_d2).astype(np.float32)
+        omega_d1   = np.zeros_like(omega_d1, dtype=np.float32)
+        pmid_strip = np.zeros_like(pmid_strip, dtype=np.float32)
+    else:
+        omega_d1 = omega_d1.astype(np.float32)
+        omega_d2 = omega_d2.astype(np.float32)
 
-    # ── 5-class CCG label map ─────────────────────────────────
-    y_c5 = np.zeros((H, W), dtype=np.int64)
-    y_c5[y_out.astype(bool)]   = 1   # Ω_Δ2 (overridden below)
-    y_c5[y_mid.astype(bool)]   = 3   # Ω_Δ1 (overridden below)
-    y_c5[omega_I]              = 4   # Ω_I
-    y_c5[pmid_strip.astype(bool) & y_out.astype(bool)] = 2  # P_mid strip
+    # ── 3-class CCG label map ─────────────────────────────────
+    # Class 0: Ω_O  (certain background — outside P_out)
+    # Class 1: Ω_Δ  (uncertain — inside P_out, outside P_in)
+    # Class 2: Ω_I  (certain foreground — inside P_in)
+    y_c3 = np.zeros((H, W), dtype=np.int64)
+    y_c3[y_out.astype(bool)] = 1   # uncertain (overridden below)
+    y_c3[y_in.astype(bool)]  = 2   # certain FG
 
     return (
-        y_in.astype(np.float32),          # certain FG
-        y_mid.astype(np.float32),         # P_mid fill
-        y_out.astype(np.float32),         # envelope
-        omega_d1.astype(np.float32),      # Ω_Δ1
-        omega_d2.astype(np.float32),      # Ω_Δ2
-        softlabel,                         # soft label
-        pmid_strip.astype(np.float32),    # P_mid boundary strip
-        y_c5,                              # 5-class CCG labels
+        y_in.astype(np.float32),       # certain FG
+        y_mid.astype(np.float32),      # P_mid fill
+        y_out.astype(np.float32),      # envelope
+        omega_d1.astype(np.float32),   # Ω_Δ1
+        omega_d2.astype(np.float32),   # Ω_Δ2
+        pmid_strip.astype(np.float32), # P_mid strip
+        y_c3,                          # 3-class CCG
     )
 
 
@@ -235,11 +215,17 @@ class PolypDataset(data.Dataset):
         self.size = len(self.images)
 
         if self.augmentations == 'True' or self.augmentations is True:
-            print('Using RandomRotation, RandomFlip')
+            print('Using RandomRotation, RandomFlip, ColorJitter')
             self.img_transform = transforms.Compose([
                 transforms.RandomRotation(90),
                 transforms.RandomVerticalFlip(p=0.5),
                 transforms.RandomHorizontalFlip(p=0.5),
+                transforms.ColorJitter(          # NEW
+                    brightness=0.3,
+                    contrast=0.3,
+                    saturation=0.2,
+                    hue=0.1
+                ),
                 transforms.Resize((self.trainsize, self.trainsize)),
                 transforms.ToTensor(),
                 transforms.Normalize([0.485, 0.456, 0.406],
@@ -266,36 +252,31 @@ class PolypDataset(data.Dataset):
             ])
 
     def __getitem__(self, index):
-        image = self.rgb_loader(self.images[index])
-
-        # GT loaded only to derive polygon masks — never used as training label
+        image  = self.rgb_loader(self.images[index])
         gt_pil = self.binary_loader(self.gts[index])
 
         # Synchronised augmentation
         seed = np.random.randint(2147483647)
         random.seed(seed);  torch.manual_seed(seed)
-        image = self.img_transform(image)       # (3, H, W)
+        image = self.img_transform(image)
         random.seed(seed);  torch.manual_seed(seed)
-        gt_t  = self.gt_transform(gt_pil)      # (1, H, W) float [0,1]
+        gt_t  = self.gt_transform(gt_pil)
 
-        # MRPAnno generation from the augmented, resized GT
-        gt_np = gt_t.squeeze().cpu().numpy()   # (H, W)
+        gt_np = gt_t.squeeze().cpu().numpy()
         (y_in, y_mid, y_out,
          omega_d1, omega_d2,
-         softlabel, pmid_strip,
-         y_c5) = generate_mrpanno(gt_np)
+         pmid_strip, y_c3) = generate_mrpanno(gt_np)
 
         return (
-            image,                                        # (3,H,W)
-            torch.from_numpy(y_in).float(),               # certain FG
-            torch.from_numpy(y_mid).float(),              # P_mid fill
-            torch.from_numpy(y_out).float(),              # envelope
-            torch.from_numpy(omega_d1).float(),           # Ω_Δ1
-            torch.from_numpy(omega_d2).float(),           # Ω_Δ2
-            torch.from_numpy(softlabel).float(),          # soft label
-            torch.from_numpy(pmid_strip).float(),         # P_mid strip
-            torch.from_numpy(y_c5).long(),                # 5-class CCG
-            gt_t,                                         # GT — val/test only
+            image,                                         # (3,H,W)
+            torch.from_numpy(y_in).float(),                # certain FG
+            torch.from_numpy(y_mid).float(),               # P_mid fill
+            torch.from_numpy(y_out).float(),               # envelope
+            torch.from_numpy(omega_d1).float(),            # Ω_Δ1
+            torch.from_numpy(omega_d2).float(),            # Ω_Δ2
+            torch.from_numpy(pmid_strip).float(),          # P_mid strip
+            torch.from_numpy(y_c3).long(),                 # 3-class CCG
+            gt_t,                                          # GT — val only
         )
 
     def filter_files(self):
@@ -312,13 +293,11 @@ class PolypDataset(data.Dataset):
 
     def rgb_loader(self, path):
         with open(path, 'rb') as f:
-            img = Image.open(f)
-            return img.convert('RGB')
+            return Image.open(f).convert('RGB')
 
     def binary_loader(self, path):
         with open(path, 'rb') as f:
-            img = Image.open(f)
-            return img.convert('L')
+            return Image.open(f).convert('L')
 
     def __len__(self):
         return self.size
@@ -328,23 +307,21 @@ def get_loader(image_root, gt_root, batchsize, trainsize,
                shuffle=False, num_workers=4,
                pin_memory=True, augmentation=False,
                split='train', color_image=True):
-
     dataset = PolypDataset(
         image_root, gt_root, trainsize,
         augmentation, split, color_image
     )
-    data_loader = data.DataLoader(
+    return data.DataLoader(
         dataset=dataset,
         batch_size=batchsize,
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=pin_memory
     )
-    return data_loader
 
 
 # ─────────────────────────────────────────────────────────────
-# Test dataset  (unchanged — GT used for metrics only)
+# Test dataset
 # ─────────────────────────────────────────────────────────────
 
 class test_dataset:
