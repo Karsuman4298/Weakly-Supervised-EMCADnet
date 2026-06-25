@@ -18,11 +18,9 @@ This repository contains the current EMCAD-based polyp segmentation pipeline use
   <img src="qualitative_results_clinicdb.jpeg" width="80%" height="25%" class="center" alt="Qualitative polyp segmentation results">
 </p>
 
-## Scribble Masking
+## HUPAnnot
 
-<p align="center">
-  <img src="scribble_mask.png" width="90%" height="30%" class="center" alt="Scribble mask example">
-</p>
+<img width="1600" height="1093" alt="image" src="https://github.com/user-attachments/assets/20af24c4-e1bf-483b-9682-6edb7aa21bdd" />
 
 ## Current project summary
 
