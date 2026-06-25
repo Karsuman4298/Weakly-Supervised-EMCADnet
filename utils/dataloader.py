@@ -1,4 +1,4 @@
-# dataloader.py  —  HUPAnno dataloader
+# dataloader.py  —  HUPAnno dataloader with PNG/JPG/TIF + NPY support
 # Returns per sample:
 #   image         (3, H, W)
 #   y_in          (H, W) float  — global P_in mask  (certain FG = Omega_I)
@@ -25,7 +25,6 @@ import torchvision.transforms as transforms
 import numpy as np
 import random
 import cv2
-from scipy.ndimage import distance_transform_edt
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +45,189 @@ HUP_LRP_DIL   = 0.08   # tight dilation scale for LRP outer ring
 HUP_LRP_ERO   = 0.06   # tight erosion scale for LRP inner ring
 HUP_MIN_AREA  = 50     # skip lesions smaller than this (px²)
 
+IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.npy')
+MASK_EXTS  = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.npy')
+
+
+# ---------------------------------------------------------------------------
+# Generic file / array helpers
+# ---------------------------------------------------------------------------
+
+def _is_valid_file(fname, exts):
+    return fname.lower().endswith(exts)
+
+
+def _stem(path):
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+def _ensure_hwc(arr):
+    """
+    Convert common array layouts to HWC if needed.
+    Supports:
+      (H, W)
+      (H, W, C)
+      (C, H, W) for C in {1, 3}
+    """
+    arr = np.asarray(arr)
+
+    if arr.ndim == 2:
+        return arr
+
+    if arr.ndim == 3:
+        # CHW -> HWC
+        if arr.shape[0] in (1, 3) and arr.shape[-1] not in (1, 3):
+            arr = np.transpose(arr, (1, 2, 0))
+        return arr
+
+    raise ValueError(f"Unsupported array shape: {arr.shape}")
+
+
+def _normalize_image_to_uint8(arr):
+    """
+    Convert arbitrary image array to uint8 [0,255].
+    Good default for PNG/JPG/NPY mixed datasets.
+
+    Notes:
+    - If array is float in [0,1], scale by 255.
+    - Otherwise min-max normalize per image.
+    """
+    arr = np.asarray(arr)
+
+    if arr.dtype == np.bool_:
+        return (arr.astype(np.uint8) * 255)
+
+    arr = arr.astype(np.float32)
+
+    if arr.size == 0:
+        return np.zeros((1, 1), dtype=np.uint8)
+
+    mn, mx = float(arr.min()), float(arr.max())
+
+    if mn >= 0.0 and mx <= 1.0:
+        arr = arr * 255.0
+    elif mn >= 0.0 and mx <= 255.0:
+        pass
+    else:
+        if mx - mn < 1e-8:
+            arr = np.zeros_like(arr)
+        else:
+            arr = (arr - mn) / (mx - mn) * 255.0
+
+    arr = np.clip(arr, 0, 255).astype(np.uint8)
+    return arr
+
+
+def _load_npy_image_as_pil(path):
+    """
+    Loads .npy image and converts to PIL RGB.
+    Handles grayscale and RGB arrays.
+    """
+    arr = np.load(path, allow_pickle=True)
+    arr = _ensure_hwc(arr)
+    arr = _normalize_image_to_uint8(arr)
+
+    if arr.ndim == 2:
+        arr = np.stack([arr, arr, arr], axis=-1)
+    elif arr.ndim == 3:
+        if arr.shape[2] == 1:
+            arr = np.repeat(arr, 3, axis=2)
+        elif arr.shape[2] >= 3:
+            arr = arr[:, :, :3]
+        else:
+            raise ValueError(f"Unsupported channel dimension in image: {arr.shape}")
+
+    return Image.fromarray(arr).convert('RGB')
+
+
+def _load_npy_mask_as_pil(path):
+    """
+    Loads .npy mask and converts to PIL grayscale binary mask.
+    Assumes binary segmentation.
+    """
+    arr = np.load(path, allow_pickle=True)
+    arr = _ensure_hwc(arr)
+
+    # reduce channels if present
+    if arr.ndim == 3:
+        if arr.shape[2] == 1:
+            arr = arr[:, :, 0]
+        else:
+            # if multi-channel binary-like mask, take max over channels
+            arr = arr.max(axis=2)
+
+    arr = np.asarray(arr)
+
+    if arr.dtype == np.bool_:
+        mask = arr.astype(np.uint8) * 255
+    else:
+        arr = arr.astype(np.float32)
+        mx = float(arr.max()) if arr.size > 0 else 0.0
+
+        # common binary cases
+        if mx <= 1.0:
+            mask = (arr > 0.5).astype(np.uint8) * 255
+        else:
+            mask = (arr > 0).astype(np.uint8) * 255
+
+    return Image.fromarray(mask, mode='L')
+
+
+def _load_image_any(path):
+    if path.lower().endswith('.npy'):
+        return _load_npy_image_as_pil(path)
+    with open(path, 'rb') as f:
+        return Image.open(f).convert('RGB')
+
+
+def _load_mask_any(path):
+    if path.lower().endswith('.npy'):
+        return _load_npy_mask_as_pil(path)
+    with open(path, 'rb') as f:
+        return Image.open(f).convert('L')
+
+
+def _get_size_any(path, is_mask=False):
+    obj = _load_mask_any(path) if is_mask else _load_image_any(path)
+    return obj.size
+
+
+def _build_image_mask_pairs(image_root, gt_root):
+    image_files = sorted([
+        os.path.join(image_root, f)
+        for f in os.listdir(image_root)
+        if _is_valid_file(f, IMAGE_EXTS)
+    ])
+    gt_files = sorted([
+        os.path.join(gt_root, f)
+        for f in os.listdir(gt_root)
+        if _is_valid_file(f, MASK_EXTS)
+    ])
+
+    if len(image_files) == 0:
+        raise RuntimeError(f'No image files found in: {image_root}')
+    if len(gt_files) == 0:
+        raise RuntimeError(f'No mask files found in: {gt_root}')
+
+    # First try exact stem matching
+    img_map = {_stem(p): p for p in image_files}
+    gt_map  = {_stem(p): p for p in gt_files}
+    common  = sorted(set(img_map.keys()) & set(gt_map.keys()))
+
+    if len(common) > 0:
+        pairs = [(img_map[k], gt_map[k]) for k in common]
+        return pairs
+
+    # Fallback: sorted order pairing
+    if len(image_files) == len(gt_files):
+        return list(zip(image_files, gt_files))
+
+    raise RuntimeError(
+        "Could not pair images and masks.\n"
+        f"Images: {len(image_files)} | Masks: {len(gt_files)}\n"
+        "Use matching filenames (same stem) or equal-length sorted folders."
+    )
+
 
 # ---------------------------------------------------------------------------
 # Polygon helper
@@ -62,26 +244,32 @@ def to_poly_mask(binary_u8, H, W,
     out = np.zeros((H, W), dtype=np.uint8)
     if not contours:
         return out
-    cnt       = max(contours, key=cv2.contourArea)
+
+    cnt = max(contours, key=cv2.contourArea)
     perimeter = cv2.arcLength(cnt, True)
     if perimeter < 10:
         return out
+
     epsilon = perimeter * dp_ratio
     polygon = cv2.approxPolyDP(cnt, epsilon, True)
+
     for _ in range(12):
         if len(polygon) > max_vtx:
             epsilon *= 1.25
-            polygon  = cv2.approxPolyDP(cnt, epsilon, True)
+            polygon = cv2.approxPolyDP(cnt, epsilon, True)
         else:
             break
+
     for _ in range(12):
         if len(polygon) < min_vtx:
             epsilon *= 0.75
-            polygon  = cv2.approxPolyDP(cnt, epsilon, True)
+            polygon = cv2.approxPolyDP(cnt, epsilon, True)
         else:
             break
+
     if len(polygon) >= 3:
         cv2.fillPoly(out, [polygon], 255)
+
     return out
 
 
@@ -97,41 +285,42 @@ def find_hard_segments(gt_u8, K=HUP_K_PATCHES, patch_arc=HUP_PATCH_ARC):
 
     Returns:
         segments : list of (center_idx, start_idx, end_idx) — non-overlapping
-        cnt      : the contour array  shape (N,1,2)
-    Returns ([], None) if contour cannot be found.
+        cnt      : contour array shape (N,1,2)
     """
     contours, _ = cv2.findContours(
         gt_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
     )
     if not contours:
         return [], None
+
     cnt = max(contours, key=cv2.contourArea)
-    N   = len(cnt)
+    N = len(cnt)
     if N < 20:
         return [], cnt
 
-    pts = cnt.reshape(-1, 2).astype(np.float32)   # (N, 2)
+    pts = cnt.reshape(-1, 2).astype(np.float32)
 
-    # --- curvature: 1 - cos(angle between successive tangent vectors) -------
-    scores = np.zeros(N)
+    # curvature: 1 - cos(angle between successive tangent vectors)
+    scores = np.zeros(N, dtype=np.float32)
     for i in range(N):
         p0 = pts[(i - 2) % N]
         p1 = pts[i]
         p2 = pts[(i + 2) % N]
+
         v1 = p1 - p0
         v2 = p2 - p1
+
         n1 = np.linalg.norm(v1) + 1e-6
         n2 = np.linalg.norm(v2) + 1e-6
-        cos_a    = np.clip(np.dot(v1 / n1, v2 / n2), -1.0, 1.0)
-        scores[i] = 1.0 - cos_a   # 0 = straight, 2 = U-turn
 
-    # smooth to avoid adjacent pixels on the same corner
-    kernel = np.ones(5) / 5.0
+        cos_a = np.clip(np.dot(v1 / n1, v2 / n2), -1.0, 1.0)
+        scores[i] = 1.0 - cos_a  # 0 = straight, 2 = U-turn
+
+    kernel = np.ones(5, dtype=np.float32) / 5.0
     scores = np.convolve(scores, kernel, mode='same')
 
-    # --- greedy non-overlapping peak selection ------------------------------
     half_patch = max(1, int(N * patch_arc / 2))
-    selected   = []
+    selected = []
     suppressed = np.zeros(N, dtype=bool)
 
     for _ in range(K):
@@ -139,10 +328,12 @@ def find_hard_segments(gt_u8, K=HUP_K_PATCHES, patch_arc=HUP_PATCH_ARC):
         masked[suppressed] = -1.0
         if masked.max() < 0:
             break
+
         center = int(np.argmax(masked))
-        start  = (center - half_patch) % N
-        end    = (center + half_patch) % N
+        start = (center - half_patch) % N
+        end   = (center + half_patch) % N
         selected.append((center, start, end))
+
         for offset in range(-half_patch * 2, half_patch * 2 + 1):
             suppressed[(center + offset) % N] = True
 
@@ -156,19 +347,6 @@ def find_hard_segments(gt_u8, K=HUP_K_PATCHES, patch_arc=HUP_PATCH_ARC):
 def generate_lrp_masks(gt_u8, H, W, K=HUP_K_PATCHES):
     """
     Generate Local Refinement Patch masks at the K hardest boundary segments.
-
-    For each hard segment:
-      - crop a bounding box from the GT
-      - apply TIGHT erosion  (much smaller than global P_in kernel)
-      - apply TIGHT dilation (much smaller than global P_out kernel)
-      - convert to polygon masks within the patch
-      - paste back into full-image maps
-
-    Returns:
-      lrp_fg        float32 (H,W) — resolved FG inside patches    (Omega_RF)
-      lrp_bg        float32 (H,W) — resolved BG inside patches    (Omega_RB)
-      lrp_uncertain float32 (H,W) — uncertain strip inside patches
-      lrp_mask      float32 (H,W) — 1 where any LRP patch exists
     """
     _empty = np.zeros((H, W), dtype=np.float32)
 
@@ -177,14 +355,12 @@ def generate_lrp_masks(gt_u8, H, W, K=HUP_K_PATCHES):
         return _empty.copy(), _empty.copy(), _empty.copy(), _empty.copy()
 
     segments, cnt = find_hard_segments(gt_u8, K=K)
-    if not segments:
+    if not segments or cnt is None:
         return _empty.copy(), _empty.copy(), _empty.copy(), _empty.copy()
 
     pts = cnt.reshape(-1, 2)
-    N   = len(pts)
 
-    # tight morph kernel sizes (much smaller than global rings)
-    radius  = np.sqrt(area / np.pi)
+    radius = np.sqrt(area / np.pi)
     lrp_ero = max(3, int(radius * HUP_LRP_ERO))
     lrp_dil = max(3, int(radius * HUP_LRP_DIL))
     if lrp_ero % 2 == 0:
@@ -203,17 +379,17 @@ def generate_lrp_masks(gt_u8, H, W, K=HUP_K_PATCHES):
     lrp_outer_all = np.zeros((H, W), dtype=np.uint8)
     lrp_mask_all  = np.zeros((H, W), dtype=np.uint8)
 
+    N = len(pts)
+
     for (center, start, end) in segments:
-        # collect contour point indices for this segment (wrap-around safe)
         if start <= end:
             seg_idx = list(range(start, end + 1))
         else:
             seg_idx = list(range(start, N)) + list(range(0, end + 1))
 
-        seg_pts = pts[seg_idx]   # (n_seg, 2)
+        seg_pts = pts[seg_idx]
 
-        # bounding box with padding
-        pad   = lrp_dil * 2
+        pad = lrp_dil * 2
         x_min = max(0, int(seg_pts[:, 0].min()) - pad)
         x_max = min(W, int(seg_pts[:, 0].max()) + pad)
         y_min = max(0, int(seg_pts[:, 1].min()) - pad)
@@ -223,16 +399,13 @@ def generate_lrp_masks(gt_u8, H, W, K=HUP_K_PATCHES):
         if patch_gt.size == 0 or patch_gt.sum() == 0:
             continue
 
-        # tight morphological operations on patch
-        patch_ero = cv2.erode(patch_gt,  ero_kernel, iterations=1)
+        patch_ero = cv2.erode(patch_gt, ero_kernel, iterations=1)
         patch_dil = cv2.dilate(patch_gt, dil_kernel, iterations=1)
 
-        # convert to polygon masks at patch resolution
         ph, pw = patch_gt.shape
         pm_ero = to_poly_mask(patch_ero, ph, pw)
         pm_dil = to_poly_mask(patch_dil, ph, pw)
 
-        # paste back (union across patches)
         lrp_inner_all[y_min:y_max, x_min:x_max] = np.maximum(
             lrp_inner_all[y_min:y_max, x_min:x_max], pm_ero
         )
@@ -241,13 +414,12 @@ def generate_lrp_masks(gt_u8, H, W, K=HUP_K_PATCHES):
         )
         lrp_mask_all[y_min:y_max, x_min:x_max] = 1
 
-    # --- derive zone maps ---------------------------------------------------
     inner_f = (lrp_inner_all > 127).astype(np.float32)
     outer_f = (lrp_outer_all > 127).astype(np.float32)
     mask_f  = lrp_mask_all.astype(np.float32)
 
-    lrp_fg        = inner_f                              # Omega_RF
-    lrp_bg        = mask_f * (1.0 - outer_f)            # Omega_RB
+    lrp_fg        = inner_f
+    lrp_bg        = mask_f * (1.0 - outer_f)
     lrp_uncertain = np.clip(outer_f - inner_f, 0.0, 1.0)
     lrp_mask      = mask_f
 
@@ -265,21 +437,14 @@ def generate_hupanno(gt_np, K=HUP_K_PATCHES):
     Args:
         gt_np : (H, W) float32 in [0, 1]
         K     : number of LRP patches
-
-    Returns (all numpy arrays):
-        y_in          float32 (H,W) — global P_in  mask  (certain FG)
-        y_out         float32 (H,W) — global P_out mask  (outer envelope)
-        omega_delta   float32 (H,W) — global uncertain ring
-        lrp_fg        float32 (H,W) — Omega_RF
-        lrp_bg        float32 (H,W) — Omega_RB
-        lrp_uncertain float32 (H,W) — narrow uncertain strip at hard segments
-        lrp_mask      float32 (H,W) — 1 where LRP patches exist
-        y_c           int64   (H,W) — 4-class CCG label map
     """
-    gt_u8 = (gt_np * 255).astype(np.uint8)
-    H, W  = gt_np.shape
+    gt_np = np.asarray(gt_np, dtype=np.float32)
+    gt_np = (gt_np > 0.5).astype(np.float32)
 
-    # --- global rings (identical to BPAnno) ---------------------------------
+    gt_u8 = (gt_np * 255).astype(np.uint8)
+    H, W = gt_np.shape
+
+    # global rings
     area = float(gt_u8.sum()) / 255.0
     if area > 10:
         radius = np.sqrt(area / np.pi)
@@ -297,13 +462,14 @@ def generate_hupanno(gt_np, K=HUP_K_PATCHES):
         gt_u8,
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dil_ks, dil_ks))
     )
-    eroded  = cv2.erode(
+    eroded = cv2.erode(
         gt_u8,
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ero_ks, ero_ks))
     )
 
     m_out_u8 = to_poly_mask(dilated, H, W)
-    m_in_u8  = to_poly_mask(eroded,  H, W)
+    m_in_u8  = to_poly_mask(eroded, H, W)
+
     if m_in_u8.sum() == 0:
         m_in_u8 = gt_u8.copy()
 
@@ -314,28 +480,24 @@ def generate_hupanno(gt_np, K=HUP_K_PATCHES):
     y_out       = (m_out_u8 > 127).astype(np.float32)
     omega_delta = np.clip(y_out - y_in, 0.0, 1.0).astype(np.float32)
 
-    # --- LRP patches --------------------------------------------------------
+    # LRP patches
     lrp_fg, lrp_bg, lrp_uncertain, lrp_mask = generate_lrp_masks(
         gt_u8, H, W, K=K
     )
 
-    # --- 4-class CCG label map ----------------------------------------------
-    # Priority (highest overwrites lower):
-    #   0 = certain BG  (default / outside P_out / Omega_RB)
-    #   1 = global uncertain  (Omega_Delta non-LRP)
-    #   2 = LRP uncertain     (inside patch, between tight rings)
-    #   3 = certain FG        (inside P_in / Omega_RF)
+    # 4-class CCG labels
     y_c = np.zeros((H, W), dtype=np.int64)
+    y_c[omega_delta == 1]   = 1
+    y_c[lrp_uncertain == 1] = 2
+    y_c[lrp_bg == 1]        = 0
+    y_c[y_in == 1]          = 3
+    y_c[lrp_fg == 1]        = 3
 
-    y_c[omega_delta == 1]  = 1   # global uncertain ring
-    y_c[lrp_uncertain == 1] = 2  # LRP uncertain strip (overrides 1)
-    y_c[lrp_bg == 1]        = 0  # LRP resolved BG    (overrides 2)
-    y_c[y_in == 1]          = 3  # global certain FG   (highest priority)
-    y_c[lrp_fg == 1]        = 3  # LRP resolved FG     (highest priority)
-
-    return (y_in, y_out, omega_delta,
-            lrp_fg, lrp_bg, lrp_uncertain, lrp_mask,
-            y_c)
+    return (
+        y_in, y_out, omega_delta,
+        lrp_fg, lrp_bg, lrp_uncertain, lrp_mask,
+        y_c
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -351,16 +513,9 @@ class PolypDataset(data.Dataset):
         self.split         = split
         self.K             = K
 
-        self.images = sorted([
-            image_root + f for f in os.listdir(image_root)
-            if f.lower().endswith('.jpg') or f.lower().endswith('.png')
-        ])
-        self.gts = sorted([
-            gt_root + f for f in os.listdir(gt_root)
-            if f.lower().endswith('.png') or f.lower().endswith('.jpg')
-        ])
+        self.pairs = _build_image_mask_pairs(image_root, gt_root)
         self.filter_files()
-        self.size = len(self.images)
+        self.size = len(self.pairs)
 
         if self.augmentations in ('True', True):
             self.img_transform = transforms.Compose([
@@ -392,19 +547,23 @@ class PolypDataset(data.Dataset):
             ])
 
     def __getitem__(self, index):
-        image = self.rgb_loader(self.images[index])
-        gt    = self.binary_loader(self.gts[index])
+        img_path, gt_path = self.pairs[index]
+
+        image = self.rgb_loader(img_path)
+        gt    = self.binary_loader(gt_path)
 
         # same random seed for image and mask transforms
         seed = np.random.randint(2147483647)
         random.seed(seed)
         torch.manual_seed(seed)
         image = self.img_transform(image)
+
         random.seed(seed)
         torch.manual_seed(seed)
-        gt    = self.gt_transform(gt)
+        gt = self.gt_transform(gt)
 
         gt_np = gt.squeeze().cpu().numpy()
+        gt_np = (gt_np > 0.5).astype(np.float32)
 
         (y_in, y_out, omega_delta,
          lrp_fg, lrp_bg, lrp_uncertain, lrp_mask,
@@ -424,23 +583,23 @@ class PolypDataset(data.Dataset):
         )
 
     def filter_files(self):
-        images, gts = [], []
-        for img_path, gt_path in zip(self.images, self.gts):
-            img_size = Image.open(img_path).size
-            gt_size  = Image.open(gt_path).size
-            if img_size == gt_size:
-                images.append(img_path)
-                gts.append(gt_path)
-        self.images = images
-        self.gts    = gts
+        valid_pairs = []
+        for img_path, gt_path in self.pairs:
+            try:
+                img_size = _get_size_any(img_path, is_mask=False)
+                gt_size  = _get_size_any(gt_path, is_mask=True)
+                if img_size == gt_size:
+                    valid_pairs.append((img_path, gt_path))
+            except Exception as e:
+                print(f'[filter_files] Skipping pair due to error:\n'
+                      f'  image={img_path}\n  mask ={gt_path}\n  err  ={e}')
+        self.pairs = valid_pairs
 
     def rgb_loader(self, path):
-        with open(path, 'rb') as f:
-            return Image.open(f).convert('RGB')
+        return _load_image_any(path)
 
     def binary_loader(self, path):
-        with open(path, 'rb') as f:
-            return Image.open(f).convert('L')
+        return _load_mask_any(path)
 
     def __len__(self):
         return self.size
@@ -450,52 +609,56 @@ def get_loader(image_root, gt_root, batchsize, trainsize,
                shuffle=False, num_workers=4, pin_memory=True,
                augmentation=False, split='train', K=HUP_K_PATCHES):
     dataset = PolypDataset(
-        image_root, gt_root, trainsize,
-        augmentation, split, K=K
+        image_root=image_root,
+        gt_root=gt_root,
+        trainsize=trainsize,
+        augmentations=augmentation,
+        split=split,
+        K=K
     )
     return data.DataLoader(
-        dataset, batch_size=batchsize,
-        shuffle=shuffle, num_workers=num_workers,
+        dataset,
+        batch_size=batchsize,
+        shuffle=shuffle,
+        num_workers=num_workers,
         pin_memory=pin_memory
     )
 
 
+# ---------------------------------------------------------------------------
+# Test dataset
+# ---------------------------------------------------------------------------
+
 class test_dataset:
     def __init__(self, image_root, gt_root, testsize):
         self.testsize = testsize
-        self.images = sorted([
-            image_root + f for f in os.listdir(image_root)
-            if f.lower().endswith('.jpg') or f.lower().endswith('.png')
-        ])
-        self.gts = sorted([
-            gt_root + f for f in os.listdir(gt_root)
-            if (f.lower().endswith('.tif') or
-                f.lower().endswith('.png') or
-                f.lower().endswith('.jpg'))
-        ])
+        self.pairs = _build_image_mask_pairs(image_root, gt_root)
+        self.size = len(self.pairs)
+        self.index = 0
+
         self.transform = transforms.Compose([
             transforms.Resize((self.testsize, self.testsize)),
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406],
-                                  [0.229, 0.224, 0.225])
+                                 [0.229, 0.224, 0.225])
         ])
         self.gt_transform = transforms.ToTensor()
-        self.size  = len(self.images)
-        self.index = 0
 
     def load_data(self):
-        image = self.rgb_loader(self.images[self.index])
+        img_path, gt_path = self.pairs[self.index]
+
+        image = self.rgb_loader(img_path)
         image = self.transform(image).unsqueeze(0)
-        gt    = self.binary_loader(self.gts[self.index])
-        name  = self.images[self.index].split('/')[-1]
-        name  = name.replace('.jpg', '.png')
+
+        gt = self.binary_loader(gt_path)
+        name = os.path.basename(img_path)
+        name = os.path.splitext(name)[0] + '.png'
+
         self.index += 1
         return image, gt, name
 
     def rgb_loader(self, path):
-        with open(path, 'rb') as f:
-            return Image.open(f).convert('RGB')
+        return _load_image_any(path)
 
     def binary_loader(self, path):
-        with open(path, 'rb') as f:
-            return Image.open(f).convert('L')
+        return _load_mask_any(path)
