@@ -1,9 +1,5 @@
 # HUPAnno: From Original Design to Improved Implementation
 
-> **Author:** Suman  
-> **Context:** WS-EMCADNet for Weakly-Supervised Polyp Segmentation  
-> **Note:** This is an original methodology. HUPAnno does not appear in prior literature.
-
 ---
 
 ## 1. Overview
