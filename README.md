@@ -107,11 +107,6 @@ Here is the complete markdown document. You can save it as **`HUPAnno_Evolution.
 ---
 
 ```markdown
-# HUPAnno: From Original Design to Improved Implementation
-
-> **Author:** Suman  
-> **Context:** WS-EMCADNet for Weakly-Supervised Polyp Segmentation  
-> **Note:** This is an original methodology. HUPAnno does not appear in prior literature.
 
 ---
 
