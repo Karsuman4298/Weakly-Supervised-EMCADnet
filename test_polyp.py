@@ -9,8 +9,8 @@ import argparse
 from tqdm import tqdm
 
 # Project-specific imports
-from lib.networks import EMCADNet
-from utils.dataloader_polyp import get_loader
+from lib.networks_hup import EMCADNet
+from utils.dataloader_fs import get_loader
 from medpy.metric.binary import hd95
 
 def dice_coefficient(predicted, labels):

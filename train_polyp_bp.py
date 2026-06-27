@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from lib.networks import EMCADNet
+from lib.networks_bp import EMCADNet
 from utils.dataloader_bp import get_loader as get_loader
 from utils.utils import clip_gradient, adjust_lr, AvgMeter, cal_params_flops
 
