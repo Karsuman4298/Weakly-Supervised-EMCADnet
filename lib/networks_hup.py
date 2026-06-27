@@ -113,7 +113,7 @@ class EMCADNet(nn.Module):
                       kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(channels[3] // 2),
             nn.ReLU(inplace=True),
-            nn.Conv2d(channels[3] // 2, 4, kernel_size=1)   # 4 classes
+            nn.Conv2d(channels[3] // 2, 4, kernel_size=1)   
         )
 
         # ------------------------------------------------------------------ #
