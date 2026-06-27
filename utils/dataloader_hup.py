@@ -1,574 +1,431 @@
-# dataloader.py  —  HUPAnno dataloader with PNG/JPG/TIF + NPY support
-# Returns per sample:
-#   image         (3, H, W)
-#   y_in          (H, W) float  — global P_in mask  (certain FG = Omega_I)
-#   y_out         (H, W) float  — global P_out mask (outer envelope)
-#   omega_delta   (H, W) float  — global uncertain ring (P_out - P_in)
-#   lrp_fg        (H, W) float  — LRP resolved foreground  (Omega_RF)
-#   lrp_bg        (H, W) float  — LRP resolved background  (Omega_RB)
-#   lrp_uncertain (H, W) float  — LRP uncertain strip
-#   lrp_mask      (H, W) float  — binary: 1 where any LRP patch exists
-#   y_c           (H, W) int64  — 4-class CCG label map
-#                                  0 = certain BG  (outside P_out or Omega_RB)
-#                                  1 = uncertain   (global ring, non-LRP)
-#                                  2 = LRP uncertain (inside patch, between tight rings)
-#                                  3 = certain FG  (inside P_in or Omega_RF)
-#   gt            (1, H, W) float — original GT for validation
+# dataloader.py  —  HUPAnno dataloader with Dynamic Sizing + Multi-Format Support
+# Handles: .png, .jpg, .jpeg, .bmp, .tif, .tiff, .npy
+# Auto-scales annotation to lesion size (adapts to Kvasir large polyps vs Liver small lesions)
 
 import os
+import re
 from PIL import Image
-
 import torch
 import torch.utils.data as data
 import torchvision.transforms as transforms
-
 import numpy as np
 import random
 import cv2
-
+from torchvision.transforms import InterpolationMode
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration (Dynamic - scales automatically per image)
 # ---------------------------------------------------------------------------
 
-# Global polygon scales (same as BPAnno — fast, coarse)
-HUP_DIL_SCALE = 0.40
-HUP_ERO_SCALE = 0.22
 HUP_DP_RATIO  = 0.02
 HUP_MIN_VTX   = 5
 HUP_MAX_VTX   = 15
 
 # LRP settings
-HUP_K_PATCHES = 2      # number of hard segments per image
-HUP_PATCH_ARC = 0.12   # fraction of contour perimeter per patch
-HUP_LRP_DIL   = 0.08   # tight dilation scale for LRP outer ring
-HUP_LRP_ERO   = 0.06   # tight erosion scale for LRP inner ring
-HUP_MIN_AREA  = 50     # skip lesions smaller than this (px²)
+HUP_K_PATCHES = 2
+HUP_PATCH_ARC = 0.12
+HUP_LRP_DIL   = 0.08   # Relative to lesion radius
+HUP_LRP_ERO   = 0.06   # Relative to lesion radius
+HUP_MIN_AREA  = 20     # Reduced from 50 for small liver lesions
 
+# Supported formats
 IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.npy')
 MASK_EXTS  = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.npy')
 
 
 # ---------------------------------------------------------------------------
-# Generic file / array helpers
+# Robust File I/O Helpers
 # ---------------------------------------------------------------------------
-
-def _is_valid_file(fname, exts):
-    return fname.lower().endswith(exts)
-
 
 def _stem(path):
     return os.path.splitext(os.path.basename(path))[0]
 
 
-def _ensure_hwc(arr):
-    """
-    Convert common array layouts to HWC if needed.
-    Supports:
-      (H, W)
-      (H, W, C)
-      (C, H, W) for C in {1, 3}
-    """
-    arr = np.asarray(arr)
-
-    if arr.ndim == 2:
-        return arr
-
-    if arr.ndim == 3:
-        # CHW -> HWC
-        if arr.shape[0] in (1, 3) and arr.shape[-1] not in (1, 3):
-            arr = np.transpose(arr, (1, 2, 0))
-        return arr
-
-    raise ValueError(f"Unsupported array shape: {arr.shape}")
-
-
-def _normalize_image_to_uint8(arr):
-    """
-    Convert arbitrary image array to uint8 [0,255].
-    Good default for PNG/JPG/NPY mixed datasets.
-
-    Notes:
-    - If array is float in [0,1], scale by 255.
-    - Otherwise min-max normalize per image.
-    """
-    arr = np.asarray(arr)
-
-    if arr.dtype == np.bool_:
-        return (arr.astype(np.uint8) * 255)
-
-    arr = arr.astype(np.float32)
-
-    if arr.size == 0:
-        return np.zeros((1, 1), dtype=np.uint8)
-
-    mn, mx = float(arr.min()), float(arr.max())
-
-    if mn >= 0.0 and mx <= 1.0:
-        arr = arr * 255.0
-    elif mn >= 0.0 and mx <= 255.0:
-        pass
-    else:
-        if mx - mn < 1e-8:
-            arr = np.zeros_like(arr)
-        else:
-            arr = (arr - mn) / (mx - mn) * 255.0
-
-    arr = np.clip(arr, 0, 255).astype(np.uint8)
-    return arr
-
-
-def _load_npy_image_as_pil(path):
-    """
-    Loads .npy image and converts to PIL RGB.
-    Handles grayscale and RGB arrays.
-    """
+def _load_npy_image(path):
+    """Load .npy image -> PIL RGB. Handles (H,W), (H,W,3), (3,H,W), float[0,1], uint8[0,255]"""
     arr = np.load(path, allow_pickle=True)
-    arr = _ensure_hwc(arr)
-    arr = _normalize_image_to_uint8(arr)
-
+    
+    # Handle channel-first formats (3, H, W) or (1, H, W)
+    if arr.ndim == 3 and arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
+        arr = np.transpose(arr, (1, 2, 0))
+    
+    # Handle grayscale
     if arr.ndim == 2:
-        arr = np.stack([arr, arr, arr], axis=-1)
-    elif arr.ndim == 3:
-        if arr.shape[2] == 1:
-            arr = np.repeat(arr, 3, axis=2)
-        elif arr.shape[2] >= 3:
-            arr = arr[:, :, :3]
+        arr = np.stack([arr] * 3, axis=-1)
+    elif arr.ndim == 3 and arr.shape[2] == 1:
+        arr = np.repeat(arr, 3, axis=2)
+    elif arr.ndim == 3 and arr.shape[2] > 3:
+        arr = arr[:, :, :3]  # Take first 3 channels if RGBA
+    
+    # Normalize to uint8
+    if arr.dtype == np.bool_:
+        arr = arr.astype(np.uint8) * 255
+    elif arr.dtype != np.uint8:
+        arr = arr.astype(np.float32)
+        if arr.max() <= 1.0:
+            arr = arr * 255.0
         else:
-            raise ValueError(f"Unsupported channel dimension in image: {arr.shape}")
-
+            # Min-max normalize if range is weird
+            arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8) * 255.0
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    
     return Image.fromarray(arr).convert('RGB')
 
 
-def _load_npy_mask_as_pil(path):
-    """
-    Loads .npy mask and converts to PIL grayscale binary mask.
-    Assumes binary segmentation.
-    """
+def _load_npy_mask(path):
+    """Load .npy mask -> PIL L (grayscale). Handles binary [0,1], [0,255], bool"""
     arr = np.load(path, allow_pickle=True)
-    arr = _ensure_hwc(arr)
-
-    # reduce channels if present
+    
+    # Squeeze channel dims
     if arr.ndim == 3:
-        if arr.shape[2] == 1:
-            arr = arr[:, :, 0]
+        if arr.shape[0] == 1:
+            arr = arr.squeeze(0)
+        elif arr.shape[-1] == 1:
+            arr = arr.squeeze(-1)
         else:
-            # if multi-channel binary-like mask, take max over channels
-            arr = arr.max(axis=2)
-
-    arr = np.asarray(arr)
-
+            # Multi-channel mask: take max
+            arr = arr.max(axis=-1) if arr.shape[-1] < 10 else arr.max(axis=0)
+    
+    # Force binary 0/255
     if arr.dtype == np.bool_:
         mask = arr.astype(np.uint8) * 255
     else:
         arr = arr.astype(np.float32)
-        mx = float(arr.max()) if arr.size > 0 else 0.0
-
-        # common binary cases
-        if mx <= 1.0:
+        # Detect if normalized [0,1] or [0,255]
+        if arr.max() <= 1.0:
             mask = (arr > 0.5).astype(np.uint8) * 255
         else:
             mask = (arr > 0).astype(np.uint8) * 255
-
+    
     return Image.fromarray(mask, mode='L')
 
 
 def _load_image_any(path):
+    """Universal image loader"""
     if path.lower().endswith('.npy'):
-        return _load_npy_image_as_pil(path)
-    with open(path, 'rb') as f:
-        return Image.open(f).convert('RGB')
+        return _load_npy_image(path)
+    return Image.open(path).convert('RGB')
 
 
 def _load_mask_any(path):
+    """Universal mask loader"""
     if path.lower().endswith('.npy'):
-        return _load_npy_mask_as_pil(path)
-    with open(path, 'rb') as f:
-        return Image.open(f).convert('L')
+        return _load_npy_mask(path)
+    return Image.open(path).convert('L')
 
 
 def _get_size_any(path, is_mask=False):
-    obj = _load_mask_any(path) if is_mask else _load_image_any(path)
-    return obj.size
+    """Get (W, H) without fully loading"""
+    if path.lower().endswith('.npy'):
+        arr = np.load(path, allow_pickle=True, mmap_mode='r')
+        if arr.ndim == 2:
+            return (arr.shape[1], arr.shape[0])
+        elif arr.ndim == 3:
+            # Return (W, H) regardless of channel position
+            return (arr.shape[1], arr.shape[0]) if arr.shape[0] in (1, 3, 4) else (arr.shape[1], arr.shape[0])
+        return (arr.shape[-1], arr.shape[-2])
+    else:
+        with Image.open(path) as img:
+            return img.size
 
 
-def _build_image_mask_pairs(image_root, gt_root):
-    image_files = sorted([
-        os.path.join(image_root, f)
-        for f in os.listdir(image_root)
-        if _is_valid_file(f, IMAGE_EXTS)
-    ])
-    gt_files = sorted([
-        os.path.join(gt_root, f)
-        for f in os.listdir(gt_root)
-        if _is_valid_file(f, MASK_EXTS)
-    ])
-
-    if len(image_files) == 0:
-        raise RuntimeError(f'No image files found in: {image_root}')
-    if len(gt_files) == 0:
-        raise RuntimeError(f'No mask files found in: {gt_root}')
-
-    # First try exact stem matching
-    img_map = {_stem(p): p for p in image_files}
-    gt_map  = {_stem(p): p for p in gt_files}
-    common  = sorted(set(img_map.keys()) & set(gt_map.keys()))
-
+def _pair_images_masks(image_root, gt_root):
+    """Smart pairing: tries exact stem match, then numeric match, then ordered"""
+    img_files = sorted([f for f in os.listdir(image_root) if f.lower().endswith(IMAGE_EXTS)])
+    msk_files = sorted([f for f in os.listdir(gt_root) if f.lower().endswith(MASK_EXTS)])
+    
+    img_paths = [os.path.join(image_root, f) for f in img_files]
+    msk_paths = [os.path.join(gt_root, f) for f in msk_files]
+    
+    # Try exact stem matching first
+    img_map = {_stem(p): p for p in img_paths}
+    msk_map = {_stem(p): p for p in msk_paths}
+    common = sorted(set(img_map.keys()) & set(msk_map.keys()))
+    
     if len(common) > 0:
-        pairs = [(img_map[k], gt_map[k]) for k in common]
-        return pairs
-
-    # Fallback: sorted order pairing
-    if len(image_files) == len(gt_files):
-        return list(zip(image_files, gt_files))
-
-    raise RuntimeError(
-        "Could not pair images and masks.\n"
-        f"Images: {len(image_files)} | Masks: {len(gt_files)}\n"
-        "Use matching filenames (same stem) or equal-length sorted folders."
-    )
+        return [(img_map[k], msk_map[k]) for k in common]
+    
+    # Fallback: numeric extraction (img_001 -> mask_001)
+    def extract_num(s):
+        nums = re.findall(r'\d+', s)
+        return nums[0] if nums else s
+    
+    img_nums = {extract_num(_stem(p)): p for p in img_paths}
+    msk_nums = {extract_num(_stem(p)): p for p in msk_paths}
+    common_nums = sorted(set(img_nums.keys()) & set(msk_nums.keys()))
+    
+    if len(common_nums) > 0:
+        return [(img_nums[k], msk_nums[k]) for k in common_nums]
+    
+    # Final fallback: assume ordered
+    if len(img_paths) == len(msk_paths):
+        return list(zip(img_paths, msk_paths))
+    
+    raise ValueError(f"Cannot pair {len(img_paths)} images with {len(msk_paths)} masks")
 
 
 # ---------------------------------------------------------------------------
-# Polygon helper
+# Dynamic HUPAnno Generation
 # ---------------------------------------------------------------------------
 
-def to_poly_mask(binary_u8, H, W,
-                 dp_ratio=HUP_DP_RATIO,
-                 min_vtx=HUP_MIN_VTX,
-                 max_vtx=HUP_MAX_VTX):
-    """Convert a binary mask to a filled polygon mask using Douglas-Peucker."""
-    contours, _ = cv2.findContours(
-        binary_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
-    )
+def to_poly_mask(binary_u8, H, W, dp_ratio=HUP_DP_RATIO, min_vtx=HUP_MIN_VTX, max_vtx=HUP_MAX_VTX):
+    """Convert binary mask to filled polygon"""
+    contours, _ = cv2.findContours(binary_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     out = np.zeros((H, W), dtype=np.uint8)
     if not contours:
         return out
-
+    
     cnt = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(cnt)
+    if area < 10:  # Too small
+        return out
+    
     perimeter = cv2.arcLength(cnt, True)
     if perimeter < 10:
         return out
-
+    
     epsilon = perimeter * dp_ratio
     polygon = cv2.approxPolyDP(cnt, epsilon, True)
-
+    
+    # Adjust vertex count
     for _ in range(12):
         if len(polygon) > max_vtx:
             epsilon *= 1.25
             polygon = cv2.approxPolyDP(cnt, epsilon, True)
         else:
             break
-
     for _ in range(12):
         if len(polygon) < min_vtx:
             epsilon *= 0.75
             polygon = cv2.approxPolyDP(cnt, epsilon, True)
         else:
             break
-
+    
     if len(polygon) >= 3:
         cv2.fillPoly(out, [polygon], 255)
-
+    
     return out
 
 
-# ---------------------------------------------------------------------------
-# Hard segment detection
-# ---------------------------------------------------------------------------
-
 def find_hard_segments(gt_u8, K=HUP_K_PATCHES, patch_arc=HUP_PATCH_ARC):
-    """
-    Find K hardest boundary segments on the GT contour using curvature.
-
-    High curvature = sharp corner / narrow protrusion = genuinely hard.
-
-    Returns:
-        segments : list of (center_idx, start_idx, end_idx) — non-overlapping
-        cnt      : contour array shape (N,1,2)
-    """
-    contours, _ = cv2.findContours(
-        gt_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
-    )
+    """Find K hardest boundary segments by curvature"""
+    contours, _ = cv2.findContours(gt_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if not contours:
         return [], None
-
+    
     cnt = max(contours, key=cv2.contourArea)
     N = len(cnt)
     if N < 20:
         return [], cnt
-
+    
     pts = cnt.reshape(-1, 2).astype(np.float32)
-
-    # curvature: 1 - cos(angle between successive tangent vectors)
-    scores = np.zeros(N, dtype=np.float32)
+    scores = np.zeros(N)
+    
     for i in range(N):
-        p0 = pts[(i - 2) % N]
-        p1 = pts[i]
-        p2 = pts[(i + 2) % N]
-
-        v1 = p1 - p0
-        v2 = p2 - p1
-
-        n1 = np.linalg.norm(v1) + 1e-6
-        n2 = np.linalg.norm(v2) + 1e-6
-
-        cos_a = np.clip(np.dot(v1 / n1, v2 / n2), -1.0, 1.0)
-        scores[i] = 1.0 - cos_a  # 0 = straight, 2 = U-turn
-
-    kernel = np.ones(5, dtype=np.float32) / 5.0
-    scores = np.convolve(scores, kernel, mode='same')
-
+        p0, p1, p2 = pts[(i-2)%N], pts[i], pts[(i+2)%N]
+        v1, v2 = p1-p0, p2-p1
+        n1, n2 = np.linalg.norm(v1)+1e-6, np.linalg.norm(v2)+1e-6
+        cos_a = np.clip(np.dot(v1/n1, v2/n2), -1.0, 1.0)
+        scores[i] = 1.0 - cos_a
+    
+    scores = np.convolve(scores, np.ones(5)/5.0, mode='same')
+    
     half_patch = max(1, int(N * patch_arc / 2))
-    selected = []
-    suppressed = np.zeros(N, dtype=bool)
-
+    selected, suppressed = [], np.zeros(N, dtype=bool)
+    
     for _ in range(K):
         masked = scores.copy()
         masked[suppressed] = -1.0
         if masked.max() < 0:
             break
-
         center = int(np.argmax(masked))
-        start = (center - half_patch) % N
-        end   = (center + half_patch) % N
+        start, end = (center-half_patch)%N, (center+half_patch)%N
         selected.append((center, start, end))
-
-        for offset in range(-half_patch * 2, half_patch * 2 + 1):
-            suppressed[(center + offset) % N] = True
-
+        for offset in range(-half_patch*2, half_patch*2+1):
+            suppressed[(center+offset)%N] = True
+    
     return selected, cnt
 
 
-# ---------------------------------------------------------------------------
-# LRP mask generation
-# ---------------------------------------------------------------------------
+def generate_hupanno(gt_np, K=HUP_K_PATCHES):
+    """
+    Generate HUPAnno with DYNAMIC scaling based on lesion size.
+    Works for both large polyps (Kvasir) and small lesions (Liver).
+    """
+    # Robust normalization: force to 0/1 float first
+    gt_np = np.asarray(gt_np, dtype=np.float32)
+    gt_binary = (gt_np > 0.5).astype(np.uint8) * 255
+    H, W = gt_binary.shape
+    
+    area_px = float(gt_binary.sum()) / 255.0
+    
+    # Dynamic sizing: if lesion is tiny, use absolute minimums
+    # If large, scale proportionally
+    if area_px < 100:  # Very small lesion (liver)
+        # Use fixed small kernels instead of relative scaling
+        dil_ks, ero_ks = 5, 3
+        lrp_dil_abs, lrp_ero_abs = 3, 2
+    else:
+        # Normal relative scaling for larger lesions
+        radius = np.sqrt(area_px / np.pi)
+        dil_ks = max(5, int(radius * 0.40))
+        ero_ks = max(3, int(radius * 0.22))
+        lrp_dil_abs = max(3, int(radius * HUP_LRP_DIL))
+        lrp_ero_abs = max(3, int(radius * HUP_LRP_ERO))
+    
+    # Ensure odd kernel sizes
+    dil_ks = dil_ks + 1 if dil_ks % 2 == 0 else dil_ks
+    ero_ks = ero_ks + 1 if ero_ks % 2 == 0 else ero_ks
+    lrp_dil_abs = lrp_dil_abs + 1 if lrp_dil_abs % 2 == 0 else lrp_dil_abs
+    lrp_ero_abs = lrp_ero_abs + 1 if lrp_ero_abs % 2 == 0 else lrp_ero_abs
+    
+    # Global rings
+    dilated = cv2.dilate(gt_binary, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dil_ks, dil_ks)))
+    eroded = cv2.erode(gt_binary, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ero_ks, ero_ks)))
+    
+    m_out_u8 = to_poly_mask(dilated, H, W)
+    m_in_u8 = to_poly_mask(eroded, H, W)
+    
+    if m_in_u8.sum() == 0:
+        m_in_u8 = gt_binary.copy()
+    
+    # Ensure containment
+    m_in_u8 = cv2.bitwise_and(m_in_u8, m_out_u8)
+    
+    y_in = (m_in_u8 > 127).astype(np.float32)
+    y_out = (m_out_u8 > 127).astype(np.float32)
+    omega_delta = np.clip(y_out - y_in, 0.0, 1.0).astype(np.float32)
+    
+    # LRP patches with dynamic kernels
+    lrp_fg, lrp_bg, lrp_uncertain, lrp_mask = _generate_lrp_dynamic(
+        gt_binary, H, W, K, lrp_ero_abs, lrp_dil_abs
+    )
+    
+    # 4-class map
+    y_c = np.zeros((H, W), dtype=np.int64)
+    y_c[omega_delta == 1] = 1
+    y_c[lrp_uncertain == 1] = 2
+    y_c[lrp_bg == 1] = 0
+    y_c[y_in == 1] = 3
+    y_c[lrp_fg == 1] = 3
+    
+    return y_in, y_out, omega_delta, lrp_fg, lrp_bg, lrp_uncertain, lrp_mask, y_c
 
-def generate_lrp_masks(gt_u8, H, W, K=HUP_K_PATCHES):
-    """
-    Generate Local Refinement Patch masks at the K hardest boundary segments.
-    """
+
+def _generate_lrp_dynamic(gt_u8, H, W, K, ero_ks, dil_ks):
+    """LRP generation with pre-calculated absolute kernel sizes"""
     _empty = np.zeros((H, W), dtype=np.float32)
-
     area = float(gt_u8.sum()) / 255.0
+    
     if area < HUP_MIN_AREA:
         return _empty.copy(), _empty.copy(), _empty.copy(), _empty.copy()
-
+    
     segments, cnt = find_hard_segments(gt_u8, K=K)
     if not segments or cnt is None:
         return _empty.copy(), _empty.copy(), _empty.copy(), _empty.copy()
-
-    pts = cnt.reshape(-1, 2)
-
-    radius = np.sqrt(area / np.pi)
-    lrp_ero = max(3, int(radius * HUP_LRP_ERO))
-    lrp_dil = max(3, int(radius * HUP_LRP_DIL))
-    if lrp_ero % 2 == 0:
-        lrp_ero += 1
-    if lrp_dil % 2 == 0:
-        lrp_dil += 1
-
-    ero_kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (lrp_ero, lrp_ero)
-    )
-    dil_kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (lrp_dil, lrp_dil)
-    )
-
+    
+    pts, N = cnt.reshape(-1, 2), len(cnt)
+    
+    ero_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ero_ks, ero_ks))
+    dil_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dil_ks, dil_ks))
+    
     lrp_inner_all = np.zeros((H, W), dtype=np.uint8)
     lrp_outer_all = np.zeros((H, W), dtype=np.uint8)
-    lrp_mask_all  = np.zeros((H, W), dtype=np.uint8)
-
-    N = len(pts)
-
+    lrp_mask_all = np.zeros((H, W), dtype=np.uint8)
+    
     for (center, start, end) in segments:
-        if start <= end:
-            seg_idx = list(range(start, end + 1))
-        else:
-            seg_idx = list(range(start, N)) + list(range(0, end + 1))
-
+        seg_idx = list(range(start, end+1)) if start <= end else list(range(start, N)) + list(range(0, end+1))
         seg_pts = pts[seg_idx]
-
-        pad = lrp_dil * 2
-        x_min = max(0, int(seg_pts[:, 0].min()) - pad)
-        x_max = min(W, int(seg_pts[:, 0].max()) + pad)
-        y_min = max(0, int(seg_pts[:, 1].min()) - pad)
-        y_max = min(H, int(seg_pts[:, 1].max()) + pad)
-
+        
+        pad = dil_ks * 2
+        x_min, x_max = max(0, int(seg_pts[:,0].min())-pad), min(W, int(seg_pts[:,0].max())+pad)
+        y_min, y_max = max(0, int(seg_pts[:,1].min())-pad), min(H, int(seg_pts[:,1].max())+pad)
+        
         patch_gt = gt_u8[y_min:y_max, x_min:x_max]
         if patch_gt.size == 0 or patch_gt.sum() == 0:
             continue
-
+        
         patch_ero = cv2.erode(patch_gt, ero_kernel, iterations=1)
         patch_dil = cv2.dilate(patch_gt, dil_kernel, iterations=1)
-
+        
         ph, pw = patch_gt.shape
         pm_ero = to_poly_mask(patch_ero, ph, pw)
         pm_dil = to_poly_mask(patch_dil, ph, pw)
-
-        lrp_inner_all[y_min:y_max, x_min:x_max] = np.maximum(
-            lrp_inner_all[y_min:y_max, x_min:x_max], pm_ero
-        )
-        lrp_outer_all[y_min:y_max, x_min:x_max] = np.maximum(
-            lrp_outer_all[y_min:y_max, x_min:x_max], pm_dil
-        )
+        
+        lrp_inner_all[y_min:y_max, x_min:x_max] = np.maximum(lrp_inner_all[y_min:y_max, x_min:x_max], pm_ero)
+        lrp_outer_all[y_min:y_max, x_min:x_max] = np.maximum(lrp_outer_all[y_min:y_max, x_min:x_max], pm_dil)
         lrp_mask_all[y_min:y_max, x_min:x_max] = 1
-
+    
     inner_f = (lrp_inner_all > 127).astype(np.float32)
     outer_f = (lrp_outer_all > 127).astype(np.float32)
-    mask_f  = lrp_mask_all.astype(np.float32)
-
-    lrp_fg        = inner_f
-    lrp_bg        = mask_f * (1.0 - outer_f)
-    lrp_uncertain = np.clip(outer_f - inner_f, 0.0, 1.0)
-    lrp_mask      = mask_f
-
-    return lrp_fg, lrp_bg, lrp_uncertain, lrp_mask
+    mask_f = lrp_mask_all.astype(np.float32)
+    
+    return inner_f, mask_f * (1.0 - outer_f), np.clip(outer_f - inner_f, 0.0, 1.0), mask_f
 
 
 # ---------------------------------------------------------------------------
-# Main annotation generator
-# ---------------------------------------------------------------------------
-
-def generate_hupanno(gt_np, K=HUP_K_PATCHES):
-    """
-    Generate HUPAnno masks from a binary GT mask.
-
-    Args:
-        gt_np : (H, W) float32 in [0, 1]
-        K     : number of LRP patches
-    """
-    gt_np = np.asarray(gt_np, dtype=np.float32)
-    gt_np = (gt_np > 0.5).astype(np.float32)
-
-    gt_u8 = (gt_np * 255).astype(np.uint8)
-    H, W = gt_np.shape
-
-    # global rings
-    area = float(gt_u8.sum()) / 255.0
-    if area > 10:
-        radius = np.sqrt(area / np.pi)
-        dil_ks = max(7, int(radius * HUP_DIL_SCALE))
-        ero_ks = max(5, int(radius * HUP_ERO_SCALE))
-    else:
-        dil_ks, ero_ks = 9, 7
-
-    if dil_ks % 2 == 0:
-        dil_ks += 1
-    if ero_ks % 2 == 0:
-        ero_ks += 1
-
-    dilated = cv2.dilate(
-        gt_u8,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dil_ks, dil_ks))
-    )
-    eroded = cv2.erode(
-        gt_u8,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ero_ks, ero_ks))
-    )
-
-    m_out_u8 = to_poly_mask(dilated, H, W)
-    m_in_u8  = to_poly_mask(eroded, H, W)
-
-    if m_in_u8.sum() == 0:
-        m_in_u8 = gt_u8.copy()
-
-    # enforce P_in ⊆ P_out
-    m_in_u8 = cv2.bitwise_and(m_in_u8, m_out_u8)
-
-    y_in        = (m_in_u8  > 127).astype(np.float32)
-    y_out       = (m_out_u8 > 127).astype(np.float32)
-    omega_delta = np.clip(y_out - y_in, 0.0, 1.0).astype(np.float32)
-
-    # LRP patches
-    lrp_fg, lrp_bg, lrp_uncertain, lrp_mask = generate_lrp_masks(
-        gt_u8, H, W, K=K
-    )
-
-    # 4-class CCG labels
-    y_c = np.zeros((H, W), dtype=np.int64)
-    y_c[omega_delta == 1]   = 1
-    y_c[lrp_uncertain == 1] = 2
-    y_c[lrp_bg == 1]        = 0
-    y_c[y_in == 1]          = 3
-    y_c[lrp_fg == 1]        = 3
-
-    return (
-        y_in, y_out, omega_delta,
-        lrp_fg, lrp_bg, lrp_uncertain, lrp_mask,
-        y_c
-    )
-
-
-# ---------------------------------------------------------------------------
-# Dataset
+# Dataset Classes
 # ---------------------------------------------------------------------------
 
 class PolypDataset(data.Dataset):
-
-    def __init__(self, image_root, gt_root, trainsize,
-                 augmentations, split='train', K=HUP_K_PATCHES):
-        self.trainsize     = trainsize
+    def __init__(self, image_root, gt_root, trainsize, augmentations=True, split='train', K=HUP_K_PATCHES):
+        self.trainsize = trainsize
         self.augmentations = augmentations
-        self.split         = split
-        self.K             = K
-
-        self.pairs = _build_image_mask_pairs(image_root, gt_root)
-        self.filter_files()
+        self.split = split
+        self.K = K
+        self.pairs = _pair_images_masks(image_root, gt_root)
         self.size = len(self.pairs)
-
-        if self.augmentations in ('True', True):
+        
+        # Use NEAREST for masks to preserve binary boundaries
+        if self.augmentations in (True, 'True'):
             self.img_transform = transforms.Compose([
                 transforms.RandomRotation(90),
                 transforms.RandomVerticalFlip(p=0.5),
                 transforms.RandomHorizontalFlip(p=0.5),
-                transforms.Resize((self.trainsize, self.trainsize)),
+                transforms.Resize((trainsize, trainsize), interpolation=InterpolationMode.BILINEAR),
                 transforms.ToTensor(),
-                transforms.Normalize([0.485, 0.456, 0.406],
-                                     [0.229, 0.224, 0.225])
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
             ])
             self.gt_transform = transforms.Compose([
                 transforms.RandomRotation(90),
                 transforms.RandomVerticalFlip(p=0.5),
                 transforms.RandomHorizontalFlip(p=0.5),
-                transforms.Resize((self.trainsize, self.trainsize)),
+                transforms.Resize((trainsize, trainsize), interpolation=InterpolationMode.NEAREST),
                 transforms.ToTensor()
             ])
         else:
             self.img_transform = transforms.Compose([
-                transforms.Resize((self.trainsize, self.trainsize)),
+                transforms.Resize((trainsize, trainsize), interpolation=InterpolationMode.BILINEAR),
                 transforms.ToTensor(),
-                transforms.Normalize([0.485, 0.456, 0.406],
-                                     [0.229, 0.224, 0.225])
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
             ])
             self.gt_transform = transforms.Compose([
-                transforms.Resize((self.trainsize, self.trainsize)),
+                transforms.Resize((trainsize, trainsize), interpolation=InterpolationMode.NEAREST),
                 transforms.ToTensor()
             ])
-
+    
     def __getitem__(self, index):
         img_path, gt_path = self.pairs[index]
-
-        image = self.rgb_loader(img_path)
-        gt    = self.binary_loader(gt_path)
-
-        # same random seed for image and mask transforms
+        
+        image = _load_image_any(img_path)
+        gt = _load_mask_any(gt_path)
+        
+        # Synchronized augmentation
         seed = np.random.randint(2147483647)
         random.seed(seed)
         torch.manual_seed(seed)
         image = self.img_transform(image)
-
+        
         random.seed(seed)
         torch.manual_seed(seed)
         gt = self.gt_transform(gt)
-
+        
         gt_np = gt.squeeze().cpu().numpy()
+        # Ensure binary
         gt_np = (gt_np > 0.5).astype(np.float32)
-
-        (y_in, y_out, omega_delta,
-         lrp_fg, lrp_bg, lrp_uncertain, lrp_mask,
-         y_c) = generate_hupanno(gt_np, K=self.K)
-
+        
+        y_in, y_out, omega_delta, lrp_fg, lrp_bg, lrp_uncertain, lrp_mask, y_c = generate_hupanno(gt_np, K=self.K)
+        
         return (
             image,
             torch.from_numpy(y_in).float(),
@@ -581,84 +438,48 @@ class PolypDataset(data.Dataset):
             torch.from_numpy(y_c).long(),
             gt
         )
-
-    def filter_files(self):
-        valid_pairs = []
-        for img_path, gt_path in self.pairs:
-            try:
-                img_size = _get_size_any(img_path, is_mask=False)
-                gt_size  = _get_size_any(gt_path, is_mask=True)
-                if img_size == gt_size:
-                    valid_pairs.append((img_path, gt_path))
-            except Exception as e:
-                print(f'[filter_files] Skipping pair due to error:\n'
-                      f'  image={img_path}\n  mask ={gt_path}\n  err  ={e}')
-        self.pairs = valid_pairs
-
-    def rgb_loader(self, path):
-        return _load_image_any(path)
-
-    def binary_loader(self, path):
-        return _load_mask_any(path)
-
+    
     def __len__(self):
         return self.size
 
 
-def get_loader(image_root, gt_root, batchsize, trainsize,
-               shuffle=False, num_workers=4, pin_memory=True,
-               augmentation=False, split='train', K=HUP_K_PATCHES):
-    dataset = PolypDataset(
-        image_root=image_root,
-        gt_root=gt_root,
-        trainsize=trainsize,
-        augmentations=augmentation,
-        split=split,
-        K=K
-    )
-    return data.DataLoader(
-        dataset,
-        batch_size=batchsize,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=pin_memory
-    )
-
-
-# ---------------------------------------------------------------------------
-# Test dataset
-# ---------------------------------------------------------------------------
-
 class test_dataset:
     def __init__(self, image_root, gt_root, testsize):
         self.testsize = testsize
-        self.pairs = _build_image_mask_pairs(image_root, gt_root)
+        self.pairs = _pair_images_masks(image_root, gt_root)
         self.size = len(self.pairs)
         self.index = 0
-
+        
         self.transform = transforms.Compose([
-            transforms.Resize((self.testsize, self.testsize)),
+            transforms.Resize((testsize, testsize), interpolation=InterpolationMode.BILINEAR),
             transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406],
-                                 [0.229, 0.224, 0.225])
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
         self.gt_transform = transforms.ToTensor()
-
+    
     def load_data(self):
+        if self.index >= self.size:
+            self.index = 0
+        
         img_path, gt_path = self.pairs[self.index]
-
-        image = self.rgb_loader(img_path)
+        
+        image = _load_image_any(img_path)
         image = self.transform(image).unsqueeze(0)
-
-        gt = self.binary_loader(gt_path)
+        
+        gt = _load_mask_any(gt_path)
+        # Keep original size for metrics, or resize? Resize to testsize for consistency
+        gt = transforms.Resize((self.testsize, self.testsize), interpolation=InterpolationMode.NEAREST)(gt)
+        
         name = os.path.basename(img_path)
         name = os.path.splitext(name)[0] + '.png'
-
+        
         self.index += 1
         return image, gt, name
+    
+    def __len__(self):
+        return self.size
 
-    def rgb_loader(self, path):
-        return _load_image_any(path)
 
-    def binary_loader(self, path):
-        return _load_mask_any(path)
+def get_loader(image_root, gt_root, batchsize, trainsize, shuffle=True, num_workers=4, pin_memory=True, augmentation=True, split='train', K=HUP_K_PATCHES):
+    dataset = PolypDataset(image_root, gt_root, trainsize, augmentations=augmentation, split=split, K=K)
+    return data.DataLoader(dataset, batch_size=batchsize, shuffle=shuffle, num_workers=num_workers, pin_memory=pin_memory)
