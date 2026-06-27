@@ -1,6 +1,4 @@
-# train_polyp.py  —  WS-EMCADNet + HUPAnno
-# Faithful to annotation_ideas_detailed.md
-#
+
 #   Phase 1  (0  → 30%):  L = L_c
 #   Phase 2  (30 → 70%):  L = L_c + λ1·L_PCL(easy) + λ2·L_ce
 #   Phase 3  (70 → 100%): L = L_c + λ1·L_PCL(all)  + λ2·L_ce + λ3·L_patch
@@ -18,7 +16,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from scipy.ndimage import distance_transform_edt
 
 from lib.networks import EMCADNet
-from utils.dataloader import get_loader
+from utils.dataloader_hup import get_loader
 from utils.utils import clip_gradient, AvgMeter
 
 

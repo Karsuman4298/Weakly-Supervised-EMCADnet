@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from lib.networks import EMCADNet
-from utils.dataloader import get_loader
+from utils.dataloader_hup import get_loader
 from utils.utils import clip_gradient, adjust_lr, AvgMeter, cal_params_flops
 
 
