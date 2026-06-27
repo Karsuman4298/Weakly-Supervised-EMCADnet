@@ -1,4 +1,4 @@
-# dataloader.py  —  HUPAnno dataloader with Dynamic Sizing + Multi-Format Support
+# dataloader_hup.py  —  HUPAnno dataloader with Dynamic Sizing + Multi-Format Support
 # Handles: .png, .jpg, .jpeg, .bmp, .tif, .tiff, .npy
 # Auto-scales annotation to lesion size (adapts to Kvasir large polyps vs Liver small lesions)
 
