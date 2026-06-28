@@ -10,35 +10,52 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
 from torch.optim.lr_scheduler import CosineAnnealingLR
+
 from lib.networks_bp import EMCADNet
-from utils.dataloader_bp import get_loader as get_loader
+from utils.dataloader_bp import get_loader
 from utils.utils import clip_gradient, adjust_lr, AvgMeter, cal_params_flops
 
 
-# ------------------------------------------------------------
-# Loss Functions
-# ------------------------------------------------------------
-
-def dice_loss_masked(pred_prob, target, valid_mask=None, smooth=1e-6):
-    if valid_mask is not None:
-        pred_prob = pred_prob * valid_mask
-        target    = target    * valid_mask
-    p = pred_prob.reshape(pred_prob.shape[0], -1)
-    t = target.reshape(target.shape[0], -1).float()
-    inter = (p * t).sum(dim=1)
-    denom = p.sum(dim=1) + t.sum(dim=1)
-    return (1 - (2 * inter + smooth) / (denom + smooth)).mean()
-
+# ============================================================
+# 1. LOSS FUNCTIONS  (paper-exact)
+# ============================================================
 
 def dual_mask_loss(seg_logit, y_in, y_en, use_edge=True):
+    """
+    Paper L_c = L_in + L_out
+
+    L_in  : prediction INSIDE inner polygon (y_in)  should be 1
+    L_out : prediction OUTSIDE outer envelope (y_en) should be 0
+
+    y_in  : B x H x W  binary  (1 = certain foreground)
+    y_en  : B x H x W  binary  (1 = inside outer envelope)
+    """
     pred = torch.sigmoid(seg_logit)
     if pred.dim() == 4:
-        pred = pred.squeeze(1)
+        pred = pred.squeeze(1)          # B x H x W
 
-    L_in = dice_loss_masked(pred, y_in)
-    L_en = dice_loss_masked(pred, y_en)
-    Lc   = L_in + L_en
+    eps = 1e-6
 
+    # ── L_in : inside inner polygon prediction → 1 ──────────
+    # Constrain only to pixels where y_in == 1
+    L_in = F.binary_cross_entropy(
+        (pred * y_in).clamp(eps, 1 - eps),
+        y_in,
+        reduction='mean'
+    )
+
+    # ── L_out : outside outer envelope prediction → 0 ────────
+    # certain background = pixels where y_en == 0
+    outside_mask = (1.0 - y_en)                     # 1 outside envelope
+    L_out = F.binary_cross_entropy(
+        (pred * outside_mask).clamp(eps, 1 - eps),
+        torch.zeros_like(pred),
+        reduction='mean'
+    )
+
+    Lc = L_in + L_out
+
+    # ── Optional edge loss (boundary sharpening) ─────────────
     if use_edge:
         laplacian = torch.tensor(
             [[1,  1, 1],
@@ -48,83 +65,132 @@ def dual_mask_loss(seg_logit, y_in, y_en, use_edge=True):
             device=pred.device
         ).view(1, 1, 3, 3)
 
-        pred_4d  = pred.unsqueeze(1)
-        y_en_4d  = y_en.unsqueeze(1).float()
-
+        pred_4d   = pred.unsqueeze(1)
+        y_en_4d   = y_en.unsqueeze(1).float()
         pred_edge = F.conv2d(pred_4d,  laplacian, padding=1).squeeze(1)
         gt_edge   = F.conv2d(y_en_4d,  laplacian, padding=1).squeeze(1)
-
         edge_loss = F.l1_loss(pred_edge * y_en, gt_edge * y_en)
-        Lc = Lc + 0.3 * edge_loss
+        Lc        = Lc + 0.3 * edge_loss
 
     return Lc
 
 
-def classification_loss_ccg(cls_logits, y_c):
-    B, C, H, W   = cls_logits.shape
-    logits_flat  = cls_logits.permute(0, 2, 3, 1).reshape(-1, C)
-    labels_flat  = y_c.reshape(-1)
-    return F.cross_entropy(logits_flat, labels_flat)
+def classification_loss_ccg(cls_logits, y_c, omega_delta):
+    """
+    Paper CCG loss: 3-class cross-entropy ONLY inside
+    uncertainty ring Ω_δ.
 
+    cls_logits  : B x 3 x H x W
+    y_c         : B x H x W  long  {0=bg, 1=uncertain, 2=fg}
+    omega_delta : B x H x W  float {0, 1}
+    """
+    B, C, H, W  = cls_logits.shape
+
+    logits_flat = cls_logits.permute(0, 2, 3, 1).reshape(-1, C)
+    labels_flat = y_c.reshape(-1)
+    ring_mask   = omega_delta.reshape(-1).bool()     # only inside ring
+
+    if ring_mask.sum() == 0:
+        return torch.tensor(
+            0.0, device=cls_logits.device, requires_grad=True
+        )
+
+    return F.cross_entropy(
+        logits_flat[ring_mask],
+        labels_flat[ring_mask]
+    )
+
+
+# ============================================================
+# 2. PSEUDO LABEL GENERATION  (paper Algorithm 1, exact order)
+# ============================================================
 
 @torch.no_grad()
 def generate_pseudo_labels(seg_logit, cls_logits, omega_delta,
                             entropy_thresh=0.5):
+    """
+    Paper Algorithm 1:
+      Step 1 : initialise U = -1  (all ignored)
+      Step 2 : class-based assignment  inside Ω_δ
+      Step 3 : seg-guided refinement   inside Ω_δ
+      Step 4 : entropy OVERRIDES uncertain pixels back to -1
+      Step 5 : pixels outside Ω_δ stay -1
+
+    Returns U : B x H x W  long  {-1=ignore, 0=bg, 1=fg}
+    """
     seg_prob = torch.sigmoid(seg_logit)
     if seg_prob.dim() == 4:
-        seg_prob = seg_prob.squeeze(1)
+        seg_prob = seg_prob.squeeze(1)          # B x H x W
 
-    cls_prob = F.softmax(cls_logits, dim=1)
-    cls_pred = cls_prob.argmax(dim=1)
+    cls_prob = F.softmax(cls_logits, dim=1)     # B x 3 x H x W
+    cls_pred = cls_prob.argmax(dim=1)           # B x H x W
 
-    p_bg = cls_prob[:, 0]
-    p_fg = cls_prob[:, 2]
+    in_ring = (omega_delta == 1)
 
-    U_c = (p_fg >= p_bg).long()
-    U_c[cls_pred == 0] = 0
-    U_c[cls_pred == 2] = 1
+    # Step 1 — all ignored
+    U = torch.full_like(cls_pred, fill_value=-1, dtype=torch.long)
 
-    seg_fg_in_ring = (seg_prob >= 0.5) & (omega_delta == 1)
-    U_c[seg_fg_in_ring] = 1
+    # Step 2 — class-based labels inside ring
+    U[in_ring & (cls_pred == 0)] = 0           # background class
+    U[in_ring & (cls_pred == 2)] = 1           # foreground class
+    # cls_pred == 1  stays -1  (uncertain class)
 
+    # Step 3 — seg-model agreement refinement inside ring
+    seg_fg_in_ring = in_ring & (seg_prob >= 0.5)
+    U[seg_fg_in_ring] = 1
+
+    # Step 4 — entropy overrides: high-entropy → ignore
     eps     = 1e-6
     entropy = -(
         seg_prob * torch.log(seg_prob + eps) +
         (1 - seg_prob) * torch.log(1 - seg_prob + eps)
     )
+    U[in_ring & (entropy >= entropy_thresh)] = -1   # overrides steps 2 & 3
 
-    U_e = torch.zeros_like(U_c)
-    U_e[entropy >= entropy_thresh] = -1
+    # Step 5 — outside ring always ignored
+    U[~in_ring] = -1
 
-    U = torch.clamp(U_c + 2 * U_e, min=-1)
-    U = U * omega_delta.long()
-    U[omega_delta == 0] = -1
+    return U                                         # B x H x W
 
-    return U
 
+# ============================================================
+# 3. PIXEL CONTRASTIVE LOSS  (paper CCL)
+# ============================================================
 
 def contrastive_loss_ccl(embeddings, seg_logit, pseudo_labels,
                           omega_delta, y_in, y_en, neg_queue,
                           temperature=0.1, hard_ratio=0.7,
                           num_anchors=100, pixel_pool=512):
-    neg_queue = neg_queue.detach()
+    """
+    Paper CCL: pixel-level contrastive loss with hard/easy anchor
+    sampling and a momentum negative queue.
+
+    embeddings   : B x D x H x W  (L2-normalised in model forward)
+    neg_queue    : D x Q           (detached; updated after backward)
+    """
+    neg_queue = neg_queue.detach()                   # never enters grad graph
 
     B, D, H, W = embeddings.shape
     device     = embeddings.device
 
-    seg_pred = (torch.sigmoid(seg_logit.detach()).squeeze(1) >= 0.5).long()
-    y_hat    = seg_pred.clone()
+    # Current seg prediction (detached)
+    seg_pred = (
+        torch.sigmoid(seg_logit.detach()).squeeze(1) >= 0.5
+    ).long()                                         # B x H x W
 
+    # Refined label map: use pseudo labels inside ring,
+    # seg prediction elsewhere
+    y_hat = seg_pred.clone()
     for b in range(B):
-        valid = (omega_delta[b] == 1) & (pseudo_labels[b] != -1)
+        valid         = (omega_delta[b] == 1) & (pseudo_labels[b] != -1)
         y_hat[b][valid] = pseudo_labels[b][valid]
 
-    certain_fg = (y_in  == 1)
-    certain_bg = (y_en  == 0) & (omega_delta == 0)
-    certain_gt = torch.zeros_like(seg_pred)
+    # Certain regions (outside ring)
+    certain_fg   = (y_in  == 1)
+    certain_bg   = (y_en  == 0) & (omega_delta == 0)
+    certain_gt   = torch.zeros_like(seg_pred)
     certain_gt[certain_fg] = 1
-    certain_gt[certain_bg] = 0
-    certain_mask = (omega_delta == 0)
+    certain_mask = (omega_delta == 0)               # outside ring = certain
 
     all_anchor_embs = []
     all_anchor_lbls = []
@@ -132,14 +198,17 @@ def contrastive_loss_ccl(embeddings, seg_logit, pseudo_labels,
     all_pixel_lbls  = []
 
     for b in range(B):
+        # Hard anchors: certain pixels mis-classified  OR  ring pixels
+        # with valid pseudo label
         hard = (
             (certain_mask[b] & (seg_pred[b] != certain_gt[b])) |
             ((omega_delta[b] == 1) & (pseudo_labels[b] != -1))
         )
+        # Easy anchors: certain pixels correctly classified
         easy = certain_mask[b] & (seg_pred[b] == certain_gt[b])
 
-        h_idx = hard.nonzero(as_tuple=False)
-        e_idx = easy.nonzero(as_tuple=False)
+        h_idx = hard.nonzero(as_tuple=False)        # N_h x 2
+        e_idx = easy.nonzero(as_tuple=False)        # N_e x 2
 
         if len(h_idx) == 0 or len(e_idx) == 0:
             continue
@@ -149,30 +218,36 @@ def contrastive_loss_ccl(embeddings, seg_logit, pseudo_labels,
 
         h_sel = h_idx[torch.randperm(len(h_idx), device=device)[:n_h]]
         e_sel = e_idx[torch.randperm(len(e_idx), device=device)[:n_e]]
-        anc   = torch.cat([h_sel, e_sel], dim=0)
+        anc   = torch.cat([h_sel, e_sel], dim=0)   # num_anchors x 2
 
         ah, aw = anc[:, 0], anc[:, 1]
-        all_anchor_embs.append(embeddings[b, :, ah, aw].T)
-        all_anchor_lbls.append(y_hat[b, ah, aw])
 
-        flat_emb = embeddings[b].reshape(D, -1).T
-        flat_lbl = y_hat[b].reshape(-1)
+        # Anchor embeddings and their labels
+        all_anchor_embs.append(embeddings[b, :, ah, aw].T)   # N x D
+        all_anchor_lbls.append(y_hat[b, ah, aw])             # N
+
+        # Pixel pool for positives
+        flat_emb = embeddings[b].reshape(D, -1).T            # HW x D
+        flat_lbl = y_hat[b].reshape(-1)                      # HW
         pool_n   = min(pixel_pool, H * W)
         pool_idx = torch.randperm(H * W, device=device)[:pool_n]
-        all_pixel_embs.append(flat_emb[pool_idx])
-        all_pixel_lbls.append(flat_lbl[pool_idx])
+        all_pixel_embs.append(flat_emb[pool_idx])            # pool_n x D
+        all_pixel_lbls.append(flat_lbl[pool_idx])            # pool_n
 
     if len(all_anchor_embs) == 0:
         return torch.tensor(0.0, device=device, requires_grad=True)
 
-    anc_emb = torch.cat(all_anchor_embs, dim=0)
-    anc_lbl = torch.cat(all_anchor_lbls, dim=0)
-    pix_emb = torch.cat(all_pixel_embs,  dim=0)
-    pix_lbl = torch.cat(all_pixel_lbls,  dim=0)
+    anc_emb = torch.cat(all_anchor_embs, dim=0)   # A x D
+    anc_lbl = torch.cat(all_anchor_lbls, dim=0)   # A
+    pix_emb = torch.cat(all_pixel_embs,  dim=0)   # P x D
+    pix_lbl = torch.cat(all_pixel_lbls,  dim=0)   # P
 
-    sim_pos_pool  = torch.mm(anc_emb, pix_emb.T) / temperature
-    sim_neg_queue = torch.mm(anc_emb, neg_queue)  / temperature
-    neg_denom     = torch.exp(sim_neg_queue).sum(dim=1)
+    # Similarity matrices
+    # anc_emb & pix_emb are already L2-normalised (done in model)
+    # neg_queue shape: D x Q  →  anc @ neg_queue = A x Q
+    sim_pos_pool  = torch.mm(anc_emb, pix_emb.T) / temperature  # A x P
+    sim_neg_queue = torch.mm(anc_emb, neg_queue)  / temperature  # A x Q
+    neg_denom     = torch.exp(sim_neg_queue).sum(dim=1)           # A
 
     total_loss  = torch.tensor(0.0, device=device)
     valid_count = 0
@@ -180,149 +255,168 @@ def contrastive_loss_ccl(embeddings, seg_logit, pseudo_labels,
     for i in range(len(anc_emb)):
         li = anc_lbl[i].item()
         if li == -1:
-            continue
+            continue                             # ignore uncertain anchors
+
         pos_mask = (pix_lbl == li)
         if pos_mask.sum() == 0:
             continue
-        pos_sim = torch.exp(sim_pos_pool[i][pos_mask]).mean()
-        denom   = pos_sim + neg_denom[i]
-        loss_i  = -torch.log(pos_sim / (denom + 1e-6))
+
+        pos_sim  = torch.exp(sim_pos_pool[i][pos_mask]).mean()
+        denom    = pos_sim + neg_denom[i]
+        loss_i   = -torch.log(pos_sim / (denom + 1e-6))
         total_loss  = total_loss + loss_i
         valid_count += 1
 
     return total_loss / max(valid_count, 1)
 
 
-# ------------------------------------------------------------
-# Metrics
-# ------------------------------------------------------------
+# ============================================================
+# 4. METRICS
+# ============================================================
 
 def dice_coefficient(predicted, labels):
     if predicted.device != labels.device:
         labels = labels.to(predicted.device)
-    smooth          = 1e-6
-    predicted_flat  = predicted.contiguous().view(-1)
-    labels_flat     = labels.contiguous().view(-1)
-    intersection    = (predicted_flat * labels_flat).sum()
-    total           = predicted_flat.sum() + labels_flat.sum()
-    return (2. * intersection + smooth) / (total + smooth)
+    smooth         = 1e-6
+    p              = predicted.contiguous().view(-1)
+    g              = labels.contiguous().view(-1)
+    intersection   = (p * g).sum()
+    return (2. * intersection + smooth) / (p.sum() + g.sum() + smooth)
 
 
-def iou(predicted, labels):
+def iou_score(predicted, labels):
     if predicted.device != labels.device:
         labels = labels.to(predicted.device)
-    smooth         = 1e-6
-    predicted_flat = predicted.contiguous().view(-1)
-    labels_flat    = labels.contiguous().view(-1)
-    intersection   = (predicted_flat * labels_flat).sum()
-    union          = predicted_flat.sum() + labels_flat.sum() - intersection
+    smooth       = 1e-6
+    p            = predicted.contiguous().view(-1)
+    g            = labels.contiguous().view(-1)
+    intersection = (p * g).sum()
+    union        = p.sum() + g.sum() - intersection
     return (intersection + smooth) / (union + smooth)
 
 
-# ------------------------------------------------------------
-# Evaluation — accepts a direct image/mask root path
-# ------------------------------------------------------------
+# ============================================================
+# 5. EVALUATION
+# ============================================================
 
-def evaluate(model, image_root, gt_root, opt):
+def evaluate(model, image_root, gt_root, opt, split_name='val'):
     """
-    Evaluate on any split by passing image_root and gt_root directly.
-    This avoids any path-joining assumptions.
+    Evaluate on any split by passing image_root / gt_root directly.
+    Returns (mean_dice, mean_iou, total_images).
     """
     model.eval()
 
-    test_loader = get_loader(
-        image_root=image_root,
-        gt_root=gt_root,
-        batchsize=opt.test_batchsize,
-        trainsize=opt.img_size,
-        shuffle=False,
-        augmentation=False,
-        split='test',
-        color_image=opt.color_image
+    loader = get_loader(
+        image_root   = image_root,
+        gt_root      = gt_root,
+        batchsize    = opt.test_batchsize,
+        trainsize    = opt.img_size,
+        shuffle      = False,
+        augmentation = False,
+        split        = 'test',
+        color_image  = opt.color_image
     )
 
-    DSC          = 0.0
-    IOU          = 0.0
+    total_dice   = 0.0
+    total_iou    = 0.0
     total_images = 0
 
     with torch.no_grad():
-        for pack in test_loader:
+        for pack in loader:
             images = pack[0].cuda()
-            gts    = pack[5].cuda().float()
+            gts    = pack[5].cuda().float()         # ground-truth mask
 
             ress = model(images, mode='test')
             if not isinstance(ress, list):
                 ress = [ress]
-            predictions = ress[-1]
+            preds = ress[-1]                        # finest prediction
 
-            for idx in range(len(images)):
-                p             = predictions[idx].unsqueeze(0)
-                pred_resized  = torch.sigmoid(p).squeeze()
-                gt_resized    = gts[idx].squeeze()
-                input_binary  = (pred_resized >= 0.5).float()
-                target_binary = (gt_resized   >= 0.5).float()
+            for idx in range(images.shape[0]):
+                prob          = torch.sigmoid(preds[idx]).squeeze()
+                gt            = gts[idx].squeeze()
+                pred_bin      = (prob  >= 0.5).float()
+                gt_bin        = (gt    >= 0.5).float()
 
-                DSC += dice_coefficient(input_binary, target_binary).item()
-                IOU += iou(input_binary, target_binary).item()
+                total_dice   += dice_coefficient(pred_bin, gt_bin).item()
+                total_iou    += iou_score(pred_bin, gt_bin).item()
                 total_images += 1
 
     n = max(total_images, 1)
-    return DSC / n, IOU / n, total_images
+    return total_dice / n, total_iou / n, total_images
 
 
-# ------------------------------------------------------------
-# Training
-# ------------------------------------------------------------
+# ============================================================
+# 6. TRAINING
+# ============================================================
 
-def train(train_loader, model, optimizer, epoch, opt, model_name):
+def train_one_epoch(train_loader, model, optimizer, epoch, opt, model_name):
+    """
+    One full training epoch following EAUWSeg:
+      • epochs 1 … 0.3*E  : L_c only           (warmup)
+      • epochs 0.3*E+1 … E : L_c + CCG + CCL   (full objective)
+    """
+    global best_val_dice, test_dice_at_best_val
+    global total_train_time, dict_plot
+
     model.train()
-    global best, test_dice_at_best_val, total_train_time, dict_plot
 
-    epoch_start  = time.time()
-    loss_record  = AvgMeter()
-    size_rates   = [0.75, 1, 1.25]
-    total_step   = len(train_loader)
-    use_ccg_ccl  = (epoch > int(0.3 * opt.epoch))
+    epoch_start = time.time()
+    loss_record = AvgMeter()
+    size_rates  = [0.75, 1.0, 1.25]
+    total_step  = len(train_loader)
 
-    for i, (images, y_in, y_en, omega_delta, y_c, gts) in enumerate(
+    # Paper: warm-up for first 30 % of epochs
+    use_ccg_ccl = (epoch > int(0.3 * opt.epoch))
+
+    for step, (images, y_in, y_en, omega_delta, y_c, gts) in enumerate(
             train_loader, start=1):
 
+        # Move to GPU once per step
+        images_ori      = Variable(images).cuda()
+        y_in_ori        = y_in.float().cuda()
+        y_en_ori        = y_en.float().cuda()
+        omega_delta_ori = omega_delta.float().cuda()
+        y_c_ori         = y_c.long().cuda()
+        gts_ori         = Variable(gts).float().cuda()
+
         for rate in size_rates:
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
-            images      = Variable(images).cuda()
-            y_in        = y_in.float().cuda()
-            y_en        = y_en.float().cuda()
-            omega_delta = omega_delta.float().cuda()
-            y_c         = y_c.long().cuda()
-            gts         = Variable(gts).float().cuda()
-
-            if rate != 1:
-                trainsize = int(round(opt.img_size * rate / 32) * 32)
-                images    = F.interpolate(
-                    images,
+            # ── Multi-scale resize ───────────────────────────
+            if rate != 1.0:
+                trainsize   = int(round(opt.img_size * rate / 32) * 32)
+                images_r    = F.interpolate(
+                    images_ori,
                     size=(trainsize, trainsize),
                     mode='bilinear',
                     align_corners=True
                 )
+            else:
+                images_r = images_ori
 
-            P, cls_logits, embeddings = model(images, mode='train')
+            # ── Forward pass ─────────────────────────────────
+            # model returns:
+            #   train mode → (P_list, cls_logits, embeddings)
+            #   test  mode → P_list
+            P, cls_logits, embeddings = model(images_r, mode='train')
 
             if not isinstance(P, list):
                 P = [P]
 
+            # ── Resize helper (nearest for masks) ────────────
             def resize_mask(m, size):
-                return F.interpolate(
-                    m.unsqueeze(1).float(),
-                    size=size,
-                    mode='nearest'
-                ).squeeze(1)
+                if m.dim() == 3:
+                    m = m.unsqueeze(1)
+                out = F.interpolate(m.float(), size=size, mode='nearest')
+                return out.squeeze(1)
 
-            target_size = P[0].shape[2:]
-            y_in_r      = resize_mask(y_in, target_size)
-            y_en_r      = resize_mask(y_en, target_size)
+            target_size = P[0].shape[2:]            # H' x W' of decoder out
+            y_in_r      = resize_mask(y_in_ori,        target_size)
+            y_en_r      = resize_mask(y_en_ori,        target_size)
 
+            # ── L_c : dual-mask loss on all 4 heads + ensemble ─
             seg_ensemble = P[0] + P[1] + P[2] + P[3]
+
             loss = (
                 dual_mask_loss(P[0],         y_in_r, y_en_r) +
                 dual_mask_loss(P[1],         y_in_r, y_en_r) +
@@ -331,25 +425,38 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
                 dual_mask_loss(seg_ensemble, y_in_r, y_en_r)
             )
 
+            # ── CCG + CCL (after warmup) ──────────────────────
             emb_snapshot = None
 
             if use_ccg_ccl:
-                H_img, W_img = images.shape[2], images.shape[3]
+                H_img = images_r.shape[2]
+                W_img = images_r.shape[3]
 
-                y_in_full = resize_mask(y_in,        (H_img, W_img))
-                y_en_full = resize_mask(y_en,        (H_img, W_img))
-                od_full   = resize_mask(omega_delta, (H_img, W_img))
-                y_c_full  = F.interpolate(
-                    y_c.unsqueeze(1).float(),
+                # Resize all weak labels to image resolution
+                y_in_full   = resize_mask(y_in_ori,        (H_img, W_img))
+                y_en_full   = resize_mask(y_en_ori,        (H_img, W_img))
+                od_full     = resize_mask(omega_delta_ori, (H_img, W_img))
+                y_c_full    = F.interpolate(
+                    y_c_ori.unsqueeze(1).float(),
                     size=(H_img, W_img),
                     mode='nearest'
                 ).squeeze(1).long()
 
-                Lce    = classification_loss_ccg(cls_logits, y_c_full)
-                pseudo = generate_pseudo_labels(
-                    P[-1].detach(), cls_logits.detach(), od_full
+                # L_ce : CCG classification loss ONLY inside Ω_δ
+                Lce = classification_loss_ccg(
+                    cls_logits, y_c_full, od_full       # ← ring mask passed
                 )
 
+                # Pseudo labels for CCL
+                pseudo = generate_pseudo_labels(
+                    P[-1].detach(),
+                    cls_logits.detach(),
+                    od_full,
+                    entropy_thresh=0.5
+                )
+
+                # L_PCL : pixel contrastive loss
+                # embeddings are L2-normalised inside model.forward()
                 LPCL = contrastive_loss_ccl(
                     embeddings,
                     P[-1].detach(),
@@ -366,12 +473,17 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
 
                 loss = loss + opt.lambda1 * LPCL + opt.lambda2 * Lce
 
-                emb_snapshot = embeddings.detach().permute(
-                    0, 2, 3, 1
-                ).reshape(-1, model.embed_dim)
+                # Snapshot embeddings BEFORE backward for queue update
+                emb_snapshot = (
+                    embeddings.detach()
+                    .permute(0, 2, 3, 1)
+                    .reshape(-1, model.embed_dim)
+                )
 
+            # ── Backward ─────────────────────────────────────
             loss.backward()
 
+            # Queue update AFTER backward (no grad retained)
             if emb_snapshot is not None:
                 with torch.no_grad():
                     idx = torch.randperm(
@@ -383,115 +495,126 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
             clip_gradient(optimizer, opt.clip)
             optimizer.step()
 
-            if rate == 1:
-                loss_record.update(loss.data, opt.batchsize)
+            if rate == 1.0:
+                loss_record.update(loss.item(), opt.batchsize)
 
-        if i % 100 == 0 or i == total_step:
-            phase = "CCG+CCL" if use_ccg_ccl else "warmup-Lc"
+        # ── Logging ──────────────────────────────────────────
+        if step % 100 == 0 or step == total_step:
+            phase = 'CCG+CCL' if use_ccg_ccl else 'warmup-Lc'
             print(
                 f'{datetime.now()} '
-                f'Epoch [{epoch:03d}/{opt.epoch:03d}], '
-                f'Step [{i:04d}/{total_step:04d}], '
-                f'LR: {optimizer.param_groups[0]["lr"]:.6f}, '
+                f'Epoch [{epoch:03d}/{opt.epoch:03d}]  '
+                f'Step [{step:04d}/{total_step:04d}]  '
+                f'LR: {optimizer.param_groups[0]["lr"]:.7f}  '
                 f'Loss: {loss_record.show():.4f}  [{phase}]'
             )
 
     total_train_time += (time.time() - epoch_start)
 
-    save_path = opt.train_save
-    os.makedirs(save_path, exist_ok=True)
+    # ── Save last checkpoint ──────────────────────────────────
+    os.makedirs(opt.train_save, exist_ok=True)
     torch.save(
         model.state_dict(),
-        os.path.join(save_path, f"{model_name}-last.pth")
+        os.path.join(opt.train_save, f'{model_name}-last.pth')
     )
 
-    # Evaluate on val and test splits
+    # ── Evaluate val & test ───────────────────────────────────
     results = {}
-
-    for split_name, img_root, gt_root in [
+    for split, img_root, gt_root in [
         ('val',  f'{opt.val_path}/images/',  f'{opt.val_path}/masks/'),
         ('test', f'{opt.test_path}/images/', f'{opt.test_path}/masks/'),
     ]:
-        d_dice, d_iou, n = evaluate(model, img_root, gt_root, opt)
-        results[split_name] = d_dice
-
+        d, iou_val, n = evaluate(
+            model, img_root, gt_root, opt, split_name=split
+        )
+        results[split] = d
         msg = (
-            f'Epoch: {epoch} | Split: {split_name} | '
-            f'Dice: {d_dice:.4f} | IoU: {d_iou:.4f} | Images: {n}'
+            f'Epoch {epoch:03d} | {split:4s} | '
+            f'Dice: {d:.4f} | IoU: {iou_val:.4f} | Images: {n}'
         )
         print(msg)
         logging.info(msg)
-        dict_plot[split_name].append(d_dice)
+        dict_plot[split].append(d)
 
-    # Save best model based on val Dice
-    if results['val'] > best:
+    # ── Save best checkpoint based on val Dice ────────────────
+    if results['val'] > best_val_dice:
         msg = (
-            f'### Best Model Saved '
-            f'(Val Dice {best:.4f} -> {results["val"]:.4f}) ###'
+            f'### Best Model Updated '
+            f'(Val Dice {best_val_dice:.4f} → {results["val"]:.4f}) ###'
         )
         print(msg)
         logging.info(msg)
 
-        best                  = results['val']
+        best_val_dice         = results['val']
         test_dice_at_best_val = results['test']
 
         torch.save(
             model.state_dict(),
-            os.path.join(save_path, f"{model_name}-best.pth")
+            os.path.join(opt.train_save, f'{model_name}-best.pth')
         )
 
 
-# ------------------------------------------------------------
-# Main
-# ------------------------------------------------------------
+# ============================================================
+# 7. MAIN
+# ============================================================
 
 if __name__ == '__main__':
 
     dataset_name = 'ColonDB'
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description='EAUWSeg / BPAnno weakly-supervised training'
+    )
 
-    # Model
-    parser.add_argument('--encoder',           type=str,   default='pvt_v2_b2')
-    parser.add_argument('--expansion_factor',  type=int,   default=2)
-    parser.add_argument('--kernel_sizes',      type=int,   nargs='+', default=[1, 3, 5])
-    parser.add_argument('--lgag_ks',           type=int,   default=3)
-    parser.add_argument('--activation_mscb',   type=str,   default='relu6')
-    parser.add_argument('--no_dw_parallel',    action='store_true', default=False)
-    parser.add_argument('--concatenation',     action='store_true', default=False)
-    parser.add_argument('--no_pretrain',       action='store_true', default=False)
-    parser.add_argument('--pretrained_dir',    type=str,   default='./pretrained_pth/pvt/')
+    # ── Model ────────────────────────────────────────────────
+    parser.add_argument('--encoder',          type=str,  default='pvt_v2_b2')
+    parser.add_argument('--expansion_factor', type=int,  default=2)
+    parser.add_argument('--kernel_sizes',     type=int,  nargs='+',
+                        default=[1, 3, 5])
+    parser.add_argument('--lgag_ks',          type=int,  default=3)
+    parser.add_argument('--activation_mscb',  type=str,  default='relu6')
+    parser.add_argument('--no_dw_parallel',   action='store_true',
+                        default=False)
+    parser.add_argument('--concatenation',    action='store_true',
+                        default=False)
+    parser.add_argument('--no_pretrain',      action='store_true',
+                        default=False)
+    parser.add_argument('--pretrained_dir',   type=str,
+                        default='./pretrained_pth/pvt/')
 
-    # Training
-    parser.add_argument('--supervision',       type=str,   default='mutation')
-    parser.add_argument('--epoch',             type=int,   default=200)
-    parser.add_argument('--lr',                type=float, default=0.0005)
-    parser.add_argument('--alpha',             type=float, default=0.3)
-    parser.add_argument('--lambda1',           type=float, default=0.3)
-    parser.add_argument('--lambda2',           type=float, default=0.5)
-    parser.add_argument('--batchsize',         type=int,   default=8)
-    parser.add_argument('--test_batchsize',    type=int,   default=8)
-    parser.add_argument('--img_size',          type=int,   default=352)
-    parser.add_argument('--clip',              type=float, default=0.5)
-    parser.add_argument('--decay_rate',        type=float, default=0.1)
-    parser.add_argument('--decay_epoch',       type=int,   default=300)
-    parser.add_argument('--color_image',       default=True)
-    parser.add_argument('--augmentation',      default=True)
+    # ── Training ─────────────────────────────────────────────
+    parser.add_argument('--epoch',          type=int,   default=200)
+    parser.add_argument('--lr',             type=float, default=5e-4)
+    parser.add_argument('--lambda1',        type=float, default=0.3,
+                        help='Weight for CCL loss L_PCL')
+    parser.add_argument('--lambda2',        type=float, default=0.5,
+                        help='Weight for CCG loss L_ce')
+    parser.add_argument('--batchsize',      type=int,   default=8)
+    parser.add_argument('--test_batchsize', type=int,   default=8)
+    parser.add_argument('--img_size',       type=int,   default=352)
+    parser.add_argument('--clip',           type=float, default=0.5)
+    parser.add_argument('--decay_rate',     type=float, default=0.1)
+    parser.add_argument('--decay_epoch',    type=int,   default=300)
+    parser.add_argument('--color_image',    default=True)
+    parser.add_argument('--augmentation',   default=True)
 
-    # Paths  ← val_path is now a proper argument
+    # ── Paths ─────────────────────────────────────────────────
     parser.add_argument('--train_path',  type=str, required=True,
-                        help='Path to training split root (must contain images/ and masks/)')
+                        help='Root of training split  (contains images/ masks/)')
     parser.add_argument('--val_path',    type=str, required=True,
-                        help='Path to validation split root (must contain images/ and masks/)')
+                        help='Root of validation split (contains images/ masks/)')
     parser.add_argument('--test_path',   type=str, required=True,
-                        help='Path to test split root (must contain images/ and masks/)')
-    parser.add_argument('--train_save',  type=str, default='')
+                        help='Root of test split       (contains images/ masks/)')
+    parser.add_argument('--train_save',  type=str, default='',
+                        help='Override checkpoint save dir (auto-generated if empty)')
     parser.add_argument('--resume',      type=str, default='',
                         help='Path to .pth checkpoint to resume from')
 
     opt = parser.parse_args()
 
-    # Validate paths early
+    # ── Early path validation ─────────────────────────────────
+    IMG_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')
+    print('\n── Dataset paths ──────────────────────────────────')
     for split, path in [('train', opt.train_path),
                          ('val',   opt.val_path),
                          ('test',  opt.test_path)]:
@@ -499,18 +622,23 @@ if __name__ == '__main__':
             full = os.path.join(path, sub)
             if not os.path.isdir(full):
                 raise FileNotFoundError(
-                    f'[{split}] folder not found: {full}\n'
-                    f'Expected structure: {path}/images/ and {path}/masks/'
+                    f'[{split}] {sub}/ folder not found:\n'
+                    f'  {full}\n'
+                    f'Expected: {path}/images/  and  {path}/masks/'
                 )
-        n = len([f for f in os.listdir(os.path.join(path, 'images'))
-                 if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
-        print(f'[{split:5s}] {path}  ({n} images)')
+        n = len([
+            f for f in os.listdir(os.path.join(path, 'images'))
+            if f.lower().endswith(IMG_EXTS)
+        ])
+        print(f'  [{split:5s}]  {path}  ({n} images)')
+    print()
 
-    # Run multiple seeds
+    # ── Five independent runs (as in paper) ──────────────────
     for run in [1, 2, 3, 4, 5]:
 
+        # Per-run globals
         dict_plot             = {'val': [], 'test': []}
-        best                  = 0.0
+        best_val_dice         = 0.0
         test_dice_at_best_val = 0.0
         total_train_time      = 0.0
 
@@ -520,22 +648,23 @@ if __name__ == '__main__':
 
         run_id = (
             f"{dataset_name}_{opt.encoder}_EMCAD"
-            f"_kernel_sizes_{opt.kernel_sizes}"
+            f"_ks_{'_'.join(map(str, opt.kernel_sizes))}"
             f"_dw_{dw_mode}_{aggregation}"
-            f"_lgag_ks_{opt.lgag_ks}"
+            f"_lgag{opt.lgag_ks}"
             f"_ef{opt.expansion_factor}"
-            f"_act_mscb_{opt.activation_mscb}"
+            f"_act_{opt.activation_mscb}"
             f"_bs{opt.batchsize}"
             f"_lr{opt.lr}"
             f"_e{opt.epoch}"
             f"_aug{opt.augmentation}"
             f"_run{run}_t{timestamp}"
         )
-        run_id = run_id.replace('[', '').replace(']', '').replace(', ', '_')
-        opt.train_save = f'./model_pth/{run_id}/'
 
-        os.makedirs('logs',           exist_ok=True)
-        os.makedirs(opt.train_save,   exist_ok=True)
+        save_dir       = opt.train_save or f'./model_pth/{run_id}/'
+        opt.train_save = save_dir
+
+        os.makedirs('logs',    exist_ok=True)
+        os.makedirs(save_dir,  exist_ok=True)
 
         logging.basicConfig(
             filename=f'logs/train_log_{run_id}.log',
@@ -544,7 +673,10 @@ if __name__ == '__main__':
             force=True
         )
 
-        # Build model
+        print(f'── Run {run}/5  ──  {run_id}')
+        logging.info(f'Run {run}/5  {run_id}')
+
+        # ── Build model ──────────────────────────────────────
         model = EMCADNet(
             num_classes      = 1,
             kernel_sizes     = opt.kernel_sizes,
@@ -561,21 +693,28 @@ if __name__ == '__main__':
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         model.to(device)
 
-        # Resume
+        # Resume from checkpoint
         if opt.resume and os.path.isfile(opt.resume):
-            print(f'Resuming from: {opt.resume}')
+            print(f'  Resuming from: {opt.resume}')
             ckpt = torch.load(opt.resume, map_location=device)
-            if isinstance(ckpt, dict) and 'model' in ckpt:
-                model.load_state_dict(ckpt['model'])
-            else:
-                model.load_state_dict(ckpt)
-            print('Checkpoint loaded.')
+            # Strip profiling keys (total_ops / total_params)
+            if isinstance(ckpt, dict):
+                for meta_key in ['model', 'state_dict', 'model_state_dict']:
+                    if meta_key in ckpt:
+                        ckpt = ckpt[meta_key]
+                        break
+                ckpt = {k: v for k, v in ckpt.items()
+                        if torch.is_tensor(v)}
+            model.load_state_dict(ckpt, strict=False)
+            print('  Checkpoint loaded.')
         elif opt.resume:
-            print(f'WARNING: checkpoint not found at {opt.resume}')
+            print(f'  WARNING: checkpoint not found at {opt.resume}')
 
-        print(f'Encoder: {opt.encoder} | Decoder: EMCAD | Run: {run}')
+        print(f'  Encoder : {opt.encoder}')
+        print(f'  Device  : {device}')
         cal_params_flops(model, opt.img_size, logging)
 
+        # ── Optimiser & scheduler ────────────────────────────
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=opt.lr,
@@ -587,6 +726,7 @@ if __name__ == '__main__':
             eta_min=1e-6
         )
 
+        # ── Data loader ──────────────────────────────────────
         train_loader = get_loader(
             image_root   = f'{opt.train_path}/images/',
             gt_root      = f'{opt.train_path}/masks/',
@@ -598,21 +738,31 @@ if __name__ == '__main__':
             color_image  = opt.color_image
         )
 
-        print(f'\nStarting training: {run_id}\n')
+        print(f'  Train batches : {len(train_loader)}')
+        print(f'  Epochs        : {opt.epoch}')
+        print(f'  Warmup ends   : epoch {int(0.3 * opt.epoch)}')
+        print(f'  λ1 (CCL)      : {opt.lambda1}')
+        print(f'  λ2 (CCG)      : {opt.lambda2}\n')
 
+        # ── Training loop ────────────────────────────────────
         for epoch in range(1, opt.epoch + 1):
             adjust_lr(optimizer, opt.lr, epoch,
                       opt.decay_rate, opt.decay_epoch)
-            train(train_loader, model, optimizer, epoch, opt, run_id)
+            train_one_epoch(
+                train_loader, model, optimizer,
+                epoch, opt, run_id
+            )
             scheduler.step()
 
+        # ── Final summary ────────────────────────────────────
         summary = (
-            f"\n{'='*50}\n"
-            f"FINAL RESULTS : {run_id}\n"
-            f"Best Val Dice         : {best:.4f}\n"
-            f"Test Dice @ Best Val  : {test_dice_at_best_val:.4f}\n"
-            f"Total Train Time      : {total_train_time:.2f}s\n"
-            f"{'='*50}"
+            f"\n{'='*55}\n"
+            f"FINAL RESULTS  run {run}/5 : {run_id}\n"
+            f"  Best Val Dice         : {best_val_dice:.4f}\n"
+            f"  Test Dice @ Best Val  : {test_dice_at_best_val:.4f}\n"
+            f"  Total Train Time      : {total_train_time:.1f}s  "
+            f"({total_train_time/3600:.2f}h)\n"
+            f"{'='*55}"
         )
         print(summary)
         logging.info(summary)
