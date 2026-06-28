@@ -300,10 +300,6 @@ def iou_score(predicted, labels):
 # ============================================================
 
 def evaluate(model, image_root, gt_root, opt, split_name='val'):
-    """
-    Evaluate on any split by passing image_root / gt_root directly.
-    Returns (mean_dice, mean_iou, total_images).
-    """
     model.eval()
 
     loader = get_loader(
@@ -320,22 +316,74 @@ def evaluate(model, image_root, gt_root, opt, split_name='val'):
     total_dice   = 0.0
     total_iou    = 0.0
     total_images = 0
+    debug_done   = False
 
     with torch.no_grad():
         for pack in loader:
             images = pack[0].cuda()
-            gts    = pack[5].cuda().float()         # ground-truth mask
 
+            # ── Find GT index automatically ──────────────────
+            # Test every index to find the mask
+            if not debug_done:
+                print(f'\n[DEBUG evaluate {split_name}]')
+                print(f'  Pack length : {len(pack)}')
+                for i, p in enumerate(pack):
+                    if torch.is_tensor(p):
+                        print(
+                            f'  pack[{i}] : shape={tuple(p.shape)}'
+                            f'  min={p.min():.3f}'
+                            f'  max={p.max():.3f}'
+                            f'  dtype={p.dtype}'
+                        )
+                debug_done = True
+
+            # GT is pack[5] for BPAnno loader
+            # (image, y_in, y_en, omega_delta, y_c, gt)
+            gts = pack[5].cuda().float()
+
+            # Normalise GT to [0,1] if stored as 0/255
+            if gts.max().item() > 1.0:
+                gts = gts / 255.0
+
+            # Ensure shape B x 1 x H x W
+            if gts.dim() == 3:
+                gts = gts.unsqueeze(1)
+
+            # ── Forward ──────────────────────────────────────
             ress = model(images, mode='test')
             if not isinstance(ress, list):
                 ress = [ress]
-            preds = ress[-1]                        # finest prediction
+            preds = ress[-1]                        # finest output
 
+            # Ensure pred shape matches GT
+            if preds.shape[2:] != gts.shape[2:]:
+                preds = F.interpolate(
+                    preds,
+                    size=gts.shape[2:],
+                    mode='bilinear',
+                    align_corners=False
+                )
+
+            # ── Per-image metrics ─────────────────────────────
             for idx in range(images.shape[0]):
-                prob          = torch.sigmoid(preds[idx]).squeeze()
-                gt            = gts[idx].squeeze()
-                pred_bin      = (prob  >= 0.5).float()
-                gt_bin        = (gt    >= 0.5).float()
+                prob      = torch.sigmoid(preds[idx]).squeeze()   # H x W
+                gt        = gts[idx].squeeze()                     # H x W
+                pred_bin  = (prob >= 0.5).float()
+                gt_bin    = (gt   >= 0.5).float()
+
+                # Debug first image
+                if total_images == 0:
+                    print(
+                        f'  [First image debug]\n'
+                        f'    prob  : min={prob.min():.4f}'
+                        f'  max={prob.max():.4f}'
+                        f'  mean={prob.mean():.4f}\n'
+                        f'    gt    : min={gt.min():.4f}'
+                        f'  max={gt.max():.4f}'
+                        f'  mean={gt.mean():.4f}\n'
+                        f'    pred_bin sum : {pred_bin.sum().item():.0f}\n'
+                        f'    gt_bin   sum : {gt_bin.sum().item():.0f}'
+                    )
 
                 total_dice   += dice_coefficient(pred_bin, gt_bin).item()
                 total_iou    += iou_score(pred_bin, gt_bin).item()
