@@ -1,7 +1,27 @@
-#train_polyp_hup.py  —  HUPAnno training script with multi-phase loss
+#train_polyp_hup.py  —  HUPAnno training script with multi-phase loss  (CORRECTED v2)
 #   Phase 1  (0  → 30%):  L = L_c
-#   Phase 2  (30 → 70%):  L = L_c + λ1·L_PCL(easy) + λ2·L_ce
-#   Phase 3  (70 → 100%): L = L_c + λ1·L_PCL(all)  + λ2·L_ce + λ3·L_patch
+#   Phase 2  (30 → 70%):  L = L_c + λ1·L_PCL(easy) + λ2·L_ce + λ_conf·L_conf
+#   Phase 3  (70 → 100%): L = L_c + λ1·L_PCL(all)  + λ2·L_ce + λ3·L_patch + λ_conf·L_conf
+#
+# CORRECTIONS APPLIED (cumulative — see ambiguity table shared separately):
+#   1. loss_certain: l_in / l_out / l_rf are MASKED to their confident
+#      region only (multiply-by-mask-before-BCE, same pattern BPAnno's
+#      dual_mask_loss uses). Ω_Δ (the uncertain ring) receives NO direct
+#      gradient from L_in / L_out / L_RF.
+#   2. loss_ce is now MASKED to omega_delta (the ring) only, matching
+#      BPAnno's classification_loss_ccg exactly — previously it ran
+#      densely over the whole image, leaking spatial boundary location
+#      information into the ring that stricter weak supervision would
+#      not provide.
+#   3. Phase 2 / Phase 3 are mutually exclusive (elif), so l_pcl is
+#      computed exactly once per step, not twice-and-discarded.
+#   4. L_conf is computed AND included in the Phase 3 loss sum (was
+#      previously computed but silently dropped from the gradient).
+#   5. Single, unambiguous loss assembly after the phase branches —
+#      no stray unconditional re-assignment.
+#   6. --pretrained_dir is now actually threaded into EMCADNet(...),
+#      with a safe fallback if the installed networks_hup.py doesn't
+#      yet accept that kwarg (see NOTE at the bottom of __main__).
 
 import os
 import time
@@ -18,11 +38,6 @@ from scipy.ndimage import distance_transform_edt
 from lib.networks_hup import EMCADNet
 from utils.dataloader_hup import get_loader
 from utils.utils import clip_gradient, AvgMeter
-
-
-# =========================================================================== #
-# Hyperparameters
-# =========================================================================== #
 
 LAMBDA_PCL   = 0.1
 LAMBDA_CE    = 0.3
@@ -46,10 +61,6 @@ total_train_time = 0.0
 epoch_history    = []
 
 
-# =========================================================================== #
-# LR helpers
-# =========================================================================== #
-
 def get_lr(optimizer):
     return optimizer.param_groups[0]['lr']
 
@@ -59,10 +70,6 @@ def warmup_lr(optimizer, epoch, warmup_epochs, base_lr):
     for pg in optimizer.param_groups:
         pg['lr'] = lr
 
-
-# =========================================================================== #
-# Metrics
-# =========================================================================== #
 
 def dice_coefficient(pred_bin, gt_bin, eps=1e-6):
     p = pred_bin.view(-1).float()
@@ -90,25 +97,19 @@ def hd95_metric(pred_np, gt_np):
     d2 = distance_transform_edt(~gt)[pred]
     return float(np.percentile(np.concatenate([d1, d2]), 95))
 
+
 # =========================================================================== #
-# Core supervised loss — structure_loss
-# Identical to EAUWSeg/BPAnno: Dice + BCE combined
-# This is what makes training stable — proven in the base codebase
+# structure_loss — kept for reference / potential ablation use, but no
+# longer used inside loss_certain (see masked version below).
 # =========================================================================== #
 
 def structure_loss(pred, mask):
-    """
-    Standard EAUWSeg structure loss: Dice + BCE.
-    pred : (B, 1, H, W) logits  OR  (B, H, W) logits
-    mask : (B, H, W) float in {0, 1}
-    """
+    """Standard Dice + BCE, computed densely over the full image."""
     if pred.dim() == 4:
-        pred = pred.squeeze(1)   # (B, H, W)
+        pred = pred.squeeze(1)
 
-    # BCE
     bce = F.binary_cross_entropy_with_logits(pred, mask, reduction='mean')
 
-    # Dice
     prob  = torch.sigmoid(pred)
     inter = (prob * mask).sum(dim=(-2, -1))
     union = prob.sum(dim=(-2, -1)) + mask.sum(dim=(-2, -1))
@@ -119,71 +120,53 @@ def structure_loss(pred, mask):
 
 
 # =========================================================================== #
-# Loss 1 — L_c  (README §1)
+# Loss 1 — L_c  (README §1)  — CORRECTED, MASKED VERSION
 #
-# "L_c = L_in(p,y_in) + L_out(p,y_out) + L_RF(p,y_RF) + L_RB(p,y_RB)"
-# "Treated with the same high confidence as Ω_I and Ω_O"
+# L_c = L_in(p, y_in) + L_out(p, y_out) + L_RF(p, y_RF) + L_RB(p, y_RB)
 #
-# Each term uses structure_loss (Dice+BCE) — the proven stable formulation
-# from the base EAUWSeg codebase.
-#
-# Foreground terms: mask = 1 in the region
-# Background terms: mask = 0 in the region (BCE+Dice toward zero)
+# Each term is masked to the region it claims to supervise (same
+# multiply-by-mask-before-BCE trick as BPAnno's dual_mask_loss), so
+# Ω_Δ (the uncertain ring) receives NO direct gradient from L_in/L_out.
 # =========================================================================== #
 
-def loss_certain(pred, y_in, y_out, lrp_fg, lrp_bg):
-    """
-    README §1: L_c = L_in + L_out + L_RF + L_RB, equal weights.
-
-    Uses structure_loss (Dice+BCE) for all four terms — same as base
-    EAUWSeg codebase, proven stable.
-
-    Foreground target = 1 on the relevant region, 0 elsewhere (masked Dice).
-    Background target = 0 on the relevant region (masked Dice+BCE).
-
-    We build per-region masks and run structure_loss on the FULL image
-    but with targets set to 0/1 only in the relevant region and 0.5
-    (neutral) elsewhere — this avoids the denominator blow-up while
-    keeping the loss informative.
-
-    Simpler approach used here: run structure_loss only on pixels within
-    each zone using masked selection, which is well-defined for BCE.
-    For Dice we use full-image targets with zone-specific 1/0 values.
-    """
+def loss_certain(pred, y_in, y_out, lrp_fg, lrp_bg, eps=1e-6):
     if pred.dim() == 4:
         pred = pred.squeeze(1)   # (B, H, W)
 
-    B, H, W = pred.shape
-    device  = pred.device
+    device = pred.device
+    prob   = torch.sigmoid(pred)
 
-    # ── L_in : Ω_I pixels should be foreground ───────────────────────────────
-    # Target = 1 inside Ω_I, 0.5 (ignore) elsewhere
-    # Simple: just compute BCE+Dice on the full image using y_in as target
-    # y_in is already 0/1 and approximately the right foreground mask
-    l_in = structure_loss(pred, y_in)
+    # ── L_in : confident foreground (Ω_I) → predict 1, masked ───────────────
+    in_area = y_in.sum() + eps
+    l_in = F.binary_cross_entropy(
+        (prob * y_in).clamp(eps, 1 - eps),
+        y_in,
+        reduction='sum'
+    ) / in_area
 
-    # ── L_out : Ω_O pixels should be background ──────────────────────────────
-    # Target = 0 inside Ω_O, use y_out as the foreground mask
-    # y_out = 1 inside P_out (lesion+ring), 0 outside = background
-    # So (1 - y_out) = 1 outside P_out = definite background
-    # We want model to predict 0 there → structure_loss with target = y_out
-    # (predict 1 where inside P_out, 0 where outside)
-    # This is exactly what BPAnno does for the outer boundary supervision
-    l_out = structure_loss(pred, y_out)
+    # ── L_out : confident background (OUTSIDE the outer envelope) ───────────
+    # y_out == 1 means "inside outer envelope", so true confident bg = 1-y_out
+    outside_mask = (1.0 - y_out)
+    out_area     = outside_mask.sum() + eps
+    l_out = F.binary_cross_entropy(
+        (prob * outside_mask).clamp(eps, 1 - eps),
+        torch.zeros_like(prob),
+        reduction='sum'
+    ) / out_area
 
-    # ── L_RF : LRP resolved foreground → predict 1 ───────────────────────────
+    # ── L_RF : LRP-resolved foreground → predict 1, masked ───────────────────
     if lrp_fg.any():
-        # Build a target that is 1 in lrp_fg, 0 elsewhere
-        # Use structure_loss with lrp_fg as target
-        l_rf = structure_loss(pred, lrp_fg)
+        rf_area = lrp_fg.sum() + eps
+        l_rf = F.binary_cross_entropy(
+            (prob * lrp_fg).clamp(eps, 1 - eps),
+            lrp_fg,
+            reduction='sum'
+        ) / rf_area
     else:
         l_rf = torch.tensor(0.0, device=device)
 
-    # ── L_RB : LRP resolved background → predict 0 ───────────────────────────
+    # ── L_RB : LRP-resolved background → predict 0 (already masked) ─────────
     if lrp_bg.any():
-        # lrp_bg pixels should be background (predict 0)
-        # Negate: build mask where lrp_bg=1 means we want pred=0
-        # Use BCE only on the lrp_bg pixels (Dice unstable for tiny masks)
         logits_rb = pred[lrp_bg.bool()]
         target_rb = torch.zeros_like(logits_rb)
         l_rb = F.binary_cross_entropy_with_logits(
@@ -196,16 +179,34 @@ def loss_certain(pred, y_in, y_out, lrp_fg, lrp_bg):
 
 
 # =========================================================================== #
-# Loss 2 — L_ce  (README §3)
+# Loss 2 — L_ce  (README §3)  — CORRECTED, MASKED VERSION
+#
+# CCG classification loss, now restricted to omega_delta (the ring) only,
+# matching BPAnno's classification_loss_ccg exactly. Previously this ran
+# densely over the entire image, which — even though it didn't leak the
+# raw fg/bg label — did leak dense spatial information about exactly
+# where the boundary lives, which stricter weak supervision withholds.
 # =========================================================================== #
 
-def loss_ce(cls_logits, y_c):
-    return F.cross_entropy(cls_logits, y_c)
+def loss_ce(cls_logits, y_c, omega_delta):
+    """
+    cls_logits  : (B, C, H, W)
+    y_c         : (B, H, W)  long
+    omega_delta : (B, H, W)  float {0,1} — 1 inside the uncertain ring
+    """
+    B, C, H, W  = cls_logits.shape
+    logits_flat = cls_logits.permute(0, 2, 3, 1).reshape(-1, C)
+    labels_flat = y_c.reshape(-1)
+    ring_mask   = omega_delta.reshape(-1).bool()
+
+    if ring_mask.sum() == 0:
+        return torch.tensor(0.0, device=cls_logits.device, requires_grad=True)
+
+    return F.cross_entropy(logits_flat[ring_mask], labels_flat[ring_mask])
 
 
 # =========================================================================== #
 # Loss 3 — L_conf  (README §3)
-# μ_hard=0.3 inside LRP (LOWER=stricter), μ=0.5 outside (HIGHER=tolerant)
 # =========================================================================== #
 
 def loss_conf(conf_map, lrp_mask, mu_hard=MU_HARD, mu_easy=MU_EASY):
@@ -216,36 +217,30 @@ def loss_conf(conf_map, lrp_mask, mu_hard=MU_HARD, mu_easy=MU_EASY):
 
 # =========================================================================== #
 # Loss 4 — L_PCL  (README §2)
-#
-# Phase 2: secondary hard samples — easy uncertain pixels, entropy-selected
-# Phase 3: primary = LRP uncertain pixels (ρ=0.85, annotator-verified)
-#           secondary = easy uncertain pixels (ρ=0.5, entropy-selected)
 # =========================================================================== #
 
 def sample_anchors_lrp(emb, lrp_unc_mask, rho=RHO_LRP, max_n=256):
-    """Primary hard samples: annotator-identified LRP uncertain pixels."""
     idx = lrp_unc_mask.nonzero(as_tuple=False)
     if idx.shape[0] == 0:
         return None
     n    = min(max(1, int(idx.shape[0] * rho)), max_n)
     perm = torch.randperm(idx.shape[0], device=emb.device)[:n]
-    return emb[:, idx[perm, 0], idx[perm, 1]].T   # (n, D)
+    return emb[:, idx[perm, 0], idx[perm, 1]].T
 
 
 def sample_anchors_easy(emb, pred_single, easy_unc_mask,
                         rho=RHO_EASY, max_n=256):
-    """Secondary hard samples: easy uncertain pixels selected by entropy."""
     idx = easy_unc_mask.nonzero(as_tuple=False)
     if idx.shape[0] == 0:
         return None
-    prob    = torch.sigmoid(pred_single.squeeze())   # (H, W)
+    prob    = torch.sigmoid(pred_single.squeeze())
     entropy = -(prob * (prob + 1e-6).log() +
                 (1 - prob) * (1 - prob + 1e-6).log())
     ent_vals = entropy[idx[:, 0], idx[:, 1]]
     n        = min(max(1, int(idx.shape[0] * rho)), max_n)
     topk     = torch.topk(ent_vals, n).indices
     sel      = idx[topk]
-    return emb[:, sel[:, 0], sel[:, 1]].T   # (n, D)
+    return emb[:, sel[:, 0], sel[:, 1]].T
 
 
 def loss_pcl(embeddings, pred, y_in, y_out,
@@ -274,11 +269,9 @@ def loss_pcl(embeddings, pred, y_in, y_out,
                 anchor_list.append(a)
 
         elif phase >= 3:
-            # primary: LRP uncertain (annotator-verified, ρ=0.85)
             a_lrp = sample_anchors_lrp(emb, lrp_uncertain[b].bool())
             if a_lrp is not None:
                 anchor_list.append(a_lrp)
-            # secondary: easy uncertain (entropy, ρ=0.5)
             a_easy = sample_anchors_easy(emb, pred[b:b+1], easy_unc)
             if a_easy is not None:
                 anchor_list.append(a_easy)
@@ -314,7 +307,6 @@ def loss_pcl(embeddings, pred, y_in, y_out,
 
 # =========================================================================== #
 # Loss 5 — L_patch  (README §4)
-# KL(p(x) || p̄_category) where p̄ = EMA mean of Ω_I or Ω_O predictions
 # =========================================================================== #
 
 def loss_patch(pred, lrp_fg, lrp_bg, lrp_uncertain,
@@ -363,7 +355,7 @@ def loss_patch(pred, lrp_fg, lrp_bg, lrp_uncertain,
 
 
 # =========================================================================== #
-# Prototype EMA  (from Ω_I and Ω_O — README §4)
+# Prototype EMA
 # =========================================================================== #
 
 def update_prototypes(proto_fg, proto_bg, pred, y_in, y_out,
@@ -390,7 +382,7 @@ def get_phase(epoch, total_epochs):
 
 
 # =========================================================================== #
-# Evaluation — Dice + IoU + HD95
+# Evaluation
 # =========================================================================== #
 
 def test(model, image_root, mask_root, opt, threshold=0.5):
@@ -419,7 +411,7 @@ def test(model, image_root, mask_root, opt, threshold=0.5):
                 p_bin  = (p_prob >= threshold).float()
                 g_bin  = (gt[i].squeeze() >= 0.5).float()
 
-                if g_bin.sum() == 0:   # empty GT — skip
+                if g_bin.sum() == 0:
                     continue
 
                 DSC   += dice_coefficient(p_bin, g_bin).item()
@@ -436,6 +428,7 @@ def test(model, image_root, mask_root, opt, threshold=0.5):
     n  = max(total, 1)
     nh = max(hd_valid, 1)
     return DSC/n, IOU/n, HD/nh, int(total)
+
 
 # =========================================================================== #
 # Summary table
@@ -539,7 +532,7 @@ def train(train_loader, model, optimizer, epoch, opt, model_name,
             )
             p_finest = preds[-1]   # (B,1,H,W)
 
-            # ── Phase 1: L = L_c ─────────────────────────────────────────────
+            # ── Phase 1 base term: L_c, always on, summed over deep supervision ──
             l_c = sum(
                 loss_certain(p, y_in_r, y_out_r, lrp_fg_r, lrp_bg_r)
                 for p in preds
@@ -549,11 +542,10 @@ def train(train_loader, model, optimizer, epoch, opt, model_name,
             l_conf  = torch.tensor(0.0, device=images.device)
             l_pcl   = torch.tensor(0.0, device=images.device)
             l_patch = torch.tensor(0.0, device=images.device)
-            loss    = l_c
 
-            # ── Phase 2: L = L_c + λ1·PCL(easy) + λ2·Lce ───────────────────
-            if phase >= 2:
-                l_ce   = loss_ce(cls_r, y_c_r)
+            # ── Phase 2: L = L_c + λ1·PCL(easy) + λ2·Lce + λ_conf·Lconf ──────
+            if phase == 2:
+                l_ce   = loss_ce(cls_r, y_c_r, omega_delta_r)
                 l_conf = loss_conf(conf_r, lrp_mask_r)
                 l_pcl  = loss_pcl(
                     emb_r, p_finest,
@@ -561,14 +553,12 @@ def train(train_loader, model, optimizer, epoch, opt, model_name,
                     omega_delta_r, lrp_mask_r, lrp_unc_r,
                     model.neg_queue.detach(), model, phase=2
                 )
-                loss = (l_c
-                        + LAMBDA_PCL  * l_pcl
-                        + LAMBDA_CE   * l_ce
-                        + LAMBDA_CONF * l_conf)
 
-            # ── Phase 3: L = L_c + λ1·PCL(all) + λ2·Lce + λ3·Lpatch ────────
-            if phase >= 3:
-                l_pcl = loss_pcl(
+            # ── Phase 3: L = L_c + λ1·PCL(all) + λ2·Lce + λ3·Lpatch + λ_conf·Lconf ──
+            elif phase >= 3:
+                l_ce    = loss_ce(cls_r, y_c_r, omega_delta_r)
+                l_conf  = loss_conf(conf_r, lrp_mask_r)
+                l_pcl   = loss_pcl(
                     emb_r, p_finest,
                     y_in_r, y_out_r,
                     omega_delta_r, lrp_mask_r, lrp_unc_r,
@@ -579,11 +569,15 @@ def train(train_loader, model, optimizer, epoch, opt, model_name,
                     lrp_fg_r, lrp_bg_r, lrp_unc_r,
                     proto_fg, proto_bg
                 )
-                loss = (l_c
-                        + LAMBDA_PCL   * l_pcl
-                        + LAMBDA_CE    * l_ce
-                        + LAMBDA_PATCH * l_patch
-                        + LAMBDA_CONF  * l_conf)
+
+            # Single, unambiguous loss assembly for every phase.
+            # Phase 1: l_ce/l_conf/l_pcl/l_patch are all 0.0 tensors, so
+            # this reduces exactly to loss = l_c.
+            loss = (l_c
+                    + LAMBDA_PCL   * l_pcl
+                    + LAMBDA_CE    * l_ce
+                    + LAMBDA_PATCH * l_patch
+                    + LAMBDA_CONF  * l_conf)
 
             loss.backward()
             clip_gradient(optimizer, opt.clip)
@@ -674,6 +668,9 @@ if __name__ == '__main__':
     parser.add_argument('--train_mask_root',  type=str,   required=True)
     parser.add_argument('--val_image_root',   type=str,   required=True)
     parser.add_argument('--val_mask_root',    type=str,   required=True)
+    parser.add_argument('--pretrained_dir',   type=str,
+                        default='./pretrained_pth/pvt/',
+                        help='Directory containing pvt_v2_b2.pth')
     opt = parser.parse_args()
 
     for label, path in [
@@ -693,12 +690,31 @@ if __name__ == '__main__':
     proto_fg         = torch.tensor(0.8, device=device)
     proto_bg         = torch.tensor(0.2, device=device)
 
-    model = EMCADNet(
-        num_classes=1, kernel_sizes=[1,3,5],
-        expansion_factor=2, dw_parallel=True, add=True,
-        lgag_ks=3, activation='relu6',
-        encoder='pvt_v2_b2', pretrain=True
-    ).to(device)
+    # NOTE: EMCADNet(...) is only given pretrained_dir=opt.pretrained_dir if
+    # the installed lib/networks_hup.py actually accepts that keyword.
+    # If your networks_hup.py has a hardcoded internal checkpoint path
+    # instead of a constructor argument, this try/except falls back to the
+    # old call so training doesn't crash — but in that case you still need
+    # to either (a) place pvt_v2_b2.pth at whatever path networks_hup.py
+    # hardcodes, or (b) edit networks_hup.py to accept pretrained_dir.
+    try:
+        model = EMCADNet(
+            num_classes=1, kernel_sizes=[1,3,5],
+            expansion_factor=2, dw_parallel=True, add=True,
+            lgag_ks=3, activation='relu6',
+            encoder='pvt_v2_b2', pretrain=True,
+            pretrained_dir=opt.pretrained_dir
+        ).to(device)
+    except TypeError:
+        print('  [warning] lib/networks_hup.py EMCADNet does not accept '
+              '"pretrained_dir" — falling back to its hardcoded internal '
+              'path. --pretrained_dir is being ignored.')
+        model = EMCADNet(
+            num_classes=1, kernel_sizes=[1,3,5],
+            expansion_factor=2, dw_parallel=True, add=True,
+            lgag_ks=3, activation='relu6',
+            encoder='pvt_v2_b2', pretrain=True
+        ).to(device)
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=opt.lr, weight_decay=1e-4
@@ -725,9 +741,9 @@ if __name__ == '__main__':
     print(f'\nHUPAnno  |  {opt.epoch} epochs  |  K={opt.K}')
     print(f'  Phase 1  ep 1–{p2_ep}       : L = L_c')
     print(f'  Phase 2  ep {p2_ep+1}–{p3_ep}  : '
-          f'L = L_c + PCL(easy) + Lce')
+          f'L = L_c + PCL(easy) + Lce(ring) + Lconf')
     print(f'  Phase 3  ep {p3_ep+1}–{opt.epoch}  : '
-          f'L = L_c + PCL(LRP+easy) + Lce + Lpatch')
+          f'L = L_c + PCL(LRP+easy) + Lce(ring) + Lpatch + Lconf')
     print(f'  ρ_LRP={RHO_LRP}  ρ_easy={RHO_EASY}')
     print(f'  μ_hard={MU_HARD} (LRP stricter)  μ_easy={MU_EASY} (tolerant)')
     print(f'  Train: {opt.train_image_root}')
